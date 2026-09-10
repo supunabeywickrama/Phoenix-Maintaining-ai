@@ -15,11 +15,13 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from unified_rag.config import settings
 from unified_rag.db.database import engine, Base
 from unified_rag.db import models  # noqa: F401  — registers tables on Base
+from services.cloudinary_service import LOCAL_DATA_DIR
 
 from unified_rag.api.endpoints import router as manuals_router
 from app.assistant_api import router as assistant_router
@@ -71,6 +73,11 @@ app.add_middleware(
 app.include_router(manuals_router, tags=["Manuals"])
 app.include_router(machines_router)
 app.include_router(assistant_router)
+
+# Serves whatever CloudinaryService._upload_local() wrote when CLOUDINARY_* is
+# unset — figures/manuals fall back to this instead of real Cloudinary.
+LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(LOCAL_DATA_DIR)), name="static")
 
 
 @app.get("/health", tags=["Health"])

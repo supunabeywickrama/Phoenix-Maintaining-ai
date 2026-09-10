@@ -4,7 +4,7 @@ import base64
 import json
 from scipy.spatial import cKDTree
 from ultralytics import SAM
-from unified_rag.ai_client import get_client, MODEL_VISION
+from unified_rag.ai_client import get_client, chat_json, MODEL_VISION
 from services.llm_json import loads_tolerant
 
 class FigureSplitter:
@@ -45,23 +45,14 @@ class FigureSplitter:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                response = self.client.chat.completions.create(
-                    model=MODEL_VISION,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                        ]
-                    }],
-                    # 800 truncated busy diagrams mid-object, which surfaced as
-                    # "Expecting ',' delimiter" on all three attempts.
-                    max_tokens=2500,
-                    temperature=0.0,
-                    response_format={"type": "json_object"}
+                # chat_json() routes to Ollama's native API when running
+                # locally — its OpenAI-compatible endpoint doesn't honor
+                # think:false for qwen3-vl, so this call would otherwise
+                # burn its whole budget on hidden reasoning and never
+                # reach content (see unified_rag/ai_client.py docstring).
+                raw_content = chat_json(
+                    MODEL_VISION, prompt, image_b64=base64_image, max_tokens=2500, temperature=0.0
                 )
-
-                raw_content = response.choices[0].message.content
                 if raw_content is None:
                     raise ValueError("Qwen-VL returned None as content")
 
