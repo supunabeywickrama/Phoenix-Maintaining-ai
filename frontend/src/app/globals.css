@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+@theme {
+  --color-phoenix-50:  #fff7ed;
+  --color-phoenix-400: #fb923c;
+  --color-phoenix-500: #f97316;
+  --color-phoenix-600: #ea580c;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  background: #0b1120;
+  color: #e2e8f0;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #334155; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: #475569; }
+
+/* Markdown produced by the model. Tailwind's reset strips list markers and
+   heading sizes, so they are restored here for answer content only. */
+.answer h1, .answer h2, .answer h3 { font-weight: 700; margin: 1rem 0 .5rem; color: #fff; }
+.answer h1 { font-size: 1.35rem; }
+.answer h2 { font-size: 1.2rem; }
+.answer h3 { font-size: 1.05rem; }
+.answer p { margin-bottom: .85rem; line-height: 1.65; }
+.answer ul, .answer ol { margin: 0 0 1rem 1.5rem; }
+.answer ul { list-style: disc; }
+.answer ol { list-style: decimal; }
+.answer li { margin-bottom: .5rem; line-height: 1.55; }
+.answer strong { color: #fff; font-weight: 700; }
+.answer code {
+  background: #1e293b; padding: .1rem .35rem; border-radius: .25rem;
+  font-size: .875em;
+}
+.answer table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
+.answer th, .answer td { border: 1px solid #334155; padding: .5rem .65rem; text-align: left; }
+.answer th { background: #1e293b; font-weight: 700; }
+.answer hr { border-color: #334155; margin: 1.25rem 0; }

@@ -1,0 +1,22 @@
+# Credentials — never commit. The `.env.*` pattern also covers backups like
+# .env.bak, which a bare `.env` rule would miss.
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+node_modules/
+.next/
+out/
+build/
+
+.DS_Store
+*.log
+
+# Layout model weights (~90 MB) are byte-identical to the ones already tracked in
+# the Zynaptrix backend. Restore them with: python scripts/fetch_models.py
+backend/models/*.pt

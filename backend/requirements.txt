@@ -1,0 +1,39 @@
+# Phoenix Industries — Maintenance Copilot (backend)
+#
+# Derived from what the code actually imports. Notably absent compared with the
+# Zynaptrix product: tensorflow, scikit-learn, influxdb-client, langgraph,
+# langchain, streamlit, plotly and matplotlib — all belong to the sensor/ML side,
+# which Phoenix does not have. That removes roughly 2 GB of install.
+
+# ── API ───────────────────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-multipart          # required for PDF uploads (not imported directly)
+python-dotenv
+
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy
+psycopg2-binary           # Postgres driver used by SQLAlchemy
+pgvector
+
+# ── LLM / embeddings (Qwen over the OpenAI-compatible DashScope endpoint) ─────
+openai>=2.30.0
+
+# ── PDF parsing and layout understanding ──────────────────────────────────────
+pymupdf                   # `fitz` — page text, images, geometry
+camelot-py[cv]            # table extraction (lattice mode also needs Ghostscript)
+easyocr                   # text inside scanned figures
+ultralytics               # YOLOv8 layout detection + Mobile SAM figure splitting
+opencv-python-headless    # `cv2` — no GUI needed on a server
+Pillow
+numpy
+scipy                     # cKDTree, used to group figure components
+
+# ── Chunking ──────────────────────────────────────────────────────────────────
+langchain-text-splitters
+nest-asyncio              # lets the pipeline run inside FastAPI's event loop
+
+# ── Object storage ────────────────────────────────────────────────────────────
+cloudinary
