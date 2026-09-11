@@ -3,6 +3,7 @@ from unified_rag.retrieval.retriever import RetrievalEngine
 from unified_rag.db.database import SessionLocal
 from unified_rag.ai_client import get_client, chat_text, MODEL_CHAT
 from services.image_relevance import verify_images
+from services.table_validator import markdown_is_usable
 
 class RAGMode(Enum):
     SUMMARY = "summary"
@@ -38,7 +39,8 @@ class RAGGenerator:
     def __init__(self):
         self.retriever = RetrievalEngine()
         
-    def generate_response(self, query: str, manual_id: str, machine_id: str, mode: RAGMode = RAGMode.SUMMARY, chat_history: str = "") -> dict:
+    def generate_response(self, query: str, manual_id: str, machine_id: str, mode: RAGMode = RAGMode.SUMMARY,
+                          chat_history: str = "", retrieval_query: str = None) -> dict:
         """
         Executes the Multimodal RAG Pipeline with strict mode enforcement and provenance checks.
         """
@@ -51,26 +53,52 @@ class RAGGenerator:
             # Strip the flag from the query before search to prevent vector pollution
             query = query.replace("[DISCLAIMER_REQUIRED: MISSING_MANUAL]", "").strip()
 
+        # retrieval_query differs from `query` for wizard continuations: "next
+        # step", "I'm stuck" and "teach me step by step" carry no topical
+        # content of their own, so embedding them alone drifts retrieval onto
+        # whatever is generically nearby instead of what was actually asked
+        # about. The caller anchors this on the session's original question;
+        # `query` itself is untouched, since it is also what the LLM sees as
+        # "the current instruction".
+        search_query = (retrieval_query or query).strip() or query
+
         try:
             # STAGE 1: SEMANTIC RETRIEVAL (Fault Tolerant)
             try:
                 db = SessionLocal()
-                # Use the CLEAN query for search
-                retrieved_data = self.retriever.retrieve(db, query, manual_id, machine_id)
+                retrieved_data = self.retriever.retrieve(db, search_query, manual_id, machine_id)
             except Exception as e:
                 print(f"RAG_DB_ERROR: {e}. Falling back to manual-only context.")
             finally:
                 if db:
                     db.close()
             
-            # STAGE 1b: IMAGE RELEVANCE GATE
-            # Vector search returns its top-k regardless of fit; showing a
-            # technician a diagram of the wrong assembly is worse than none.
+            # STAGE 1b: RELEVANCE GATE (figures AND tables)
+            # Vector search returns its top-k regardless of fit. A wrong diagram
+            # or a table that does not actually bear on the question is worse
+            # than showing nothing - tables in particular are supporting
+            # evidence, not a checklist item every answer must include.
+            #
+            # The pages the answer's own TEXT is grounded on give the judge a
+            # much harder signal than caption wording alone: a figure from a
+            # page nobody cited, that just LOOKS structurally similar (e.g. a
+            # different numbered test using the same feeler-gauge/dial-
+            # indicator style diagram), is very likely a different procedure.
+            text_pages = {c.page for c in retrieved_data.get("text_chunks", []) if c.page is not None}
             if retrieved_data.get("images"):
                 try:
-                    retrieved_data["images"] = verify_images(query, retrieved_data["images"])
+                    retrieved_data["images"] = verify_images(
+                        search_query, retrieved_data["images"], context_pages=text_pages
+                    )
                 except Exception as e:
                     print(f"Image relevance check skipped: {e}")
+            if retrieved_data.get("tables"):
+                try:
+                    retrieved_data["tables"] = verify_images(
+                        search_query, retrieved_data["tables"], context_pages=text_pages
+                    )
+                except Exception as e:
+                    print(f"Table relevance check skipped: {e}")
 
             # STAGE 2: CONTEXT BUILDER
             text_context = ""
@@ -136,7 +164,10 @@ class RAGGenerator:
             ]
             for chunk in table_sources:
                 markdown = getattr(chunk, "render_markdown", None)
-                if not markdown or chunk.id in seen_tables:
+                # Guards data ingested before table_validator.is_valid_table()
+                # existed. A garbage grid must never reach the chat regardless
+                # of when it was stored.
+                if not markdown or chunk.id in seen_tables or not markdown_is_usable(markdown):
                     continue
                 seen_tables.add(chunk.id)
                 attachments.append({
@@ -288,7 +319,10 @@ class RAGGenerator:
         )
     
     def _build_procedure_prompt(self, manual_id: str, text_context: str, history_context: str, image_references: list) -> str:
-        image_tags = "\n".join([f"  - [IMAGE_{i}] for image reference {i}" for i in range(len(image_references))])
+        # Which tags exist, their kind, and full-view-before-parts ordering are
+        # appended uniformly after mode selection (the "AVAILABLE MATERIAL"
+        # block) - no separate list here, so there is only ever one ordering
+        # rule in the prompt instead of two that can disagree.
         return (
             f"You are an Industrial Maintenance Procedure Generator for: {manual_id}.\n\n"
             "YOUR TASK: Generate a COMPLETE structured repair procedure in JSON format.\n\n"
@@ -297,8 +331,8 @@ class RAGGenerator:
             "2. Do NOT write any text before or after the JSON block. No introductions. No summaries.\n"
             "3. The FIRST phase MUST be type 'safety' with lockout/tagout and PPE steps.\n"
             "4. Mark safety/critical tasks with '\"critical\": true'.\n"
-            "5. Include image references like [IMAGE_0], [IMAGE_1] in task text where relevant.\n\n"
-            f"AVAILABLE IMAGE TAGS:\n{image_tags}\n\n"
+            "5. Include image/table references like [IMAGE_0], [TABLE_0] in task text where "
+            "relevant, using the material listed below (see AVAILABLE MATERIAL).\n\n"
             "EXACT OUTPUT FORMAT:\n"
             "[PROCEDURE_START]\n"
             '{"phases": [...]}\n'
@@ -311,9 +345,8 @@ class RAGGenerator:
         """
         MODE 3: Step Clarification Prompt optimized for simple pointwise English and images.
         """
-        image_tags = "\n".join([f"  - [IMAGE_{i}] for image reference {i}" for i in range(len(image_references))])
         disclaimer = self._get_disclaimer() if missing_manual else ""
-        
+
         return (
             f"You are a Technical Mentor for: {manual_id}.\n\n"
             f"{disclaimer}"
@@ -323,9 +356,8 @@ class RAGGenerator:
             "2. ABSOLUTELY NO PARAGRAPHS. DO NOT combine your steps into a block of text.\n"
             "3. DO NOT include introductory filler (e.g., 'Let's break this down' or 'I can help with that'). Jump straight to the bullet points.\n"
             "4. Use SIMPLE ENGLISH (ELI5). No jargon. \n"
-            "5. IMAGE INCLUSION (MANDATORY): You MUST interleave relevant [IMAGE_N] tags within your bullet points. If diagrams are available, you are FORBIDDEN from finishing the response without placing them at the correct logical step.\n"
+            "5. MATERIAL: interleave the tags listed for you below (see AVAILABLE MATERIAL) at the correct logical step. If diagrams or tables are available, you are FORBIDDEN from finishing without placing them.\n"
             "6. For each sub-point, explain: What to do, Why it matters, and How to do it correctly.\n\n"
-            f"AVAILABLE IMAGE TAGS:\n{image_tags}\n\n"
             f"MANUAL SOURCE OF TRUTH:\n{text_context}"
         )
 
@@ -338,9 +370,6 @@ class RAGGenerator:
         answering "how does the hydraulic circuit work?" with a safety checklist
         and a repair procedure is the wrong shape of answer.
         """
-        image_tags = chr(10).join(
-            [f"  - [IMAGE_{i}] for image reference {i}" for i in range(len(image_references))]
-        )
         disclaimer = self._get_disclaimer() if missing_manual else ""
         return (
             f"""You are a patient technical instructor for: {manual_id}.
@@ -355,17 +384,14 @@ RULES:
 4. Name the real components and their function, and how they interact.
 5. CITE PAGES: when a fact comes from the manual, cite it as (page N) using the page numbers
    given in the context below.
-6. IMAGES: interleave [IMAGE_N] tags at the exact point in the explanation where each diagram
-   is what the reader should be looking at.
+6. MATERIAL: interleave the tags listed for you below (see AVAILABLE MATERIAL) at the exact
+   point in the explanation where each one is what the reader should be looking at.
 7. Where genuinely useful, note what typically goes wrong with a component, but do NOT turn
    this into a repair procedure.
 8. Do NOT emit any [SUGGESTION: ...] tag. This is a learning answer, not a fault report.
 
 CONVERSATION SO FAR:
 {history}
-
-AVAILABLE IMAGE TAGS:
-{image_tags}
 
 MANUAL SOURCE OF TRUTH:
 {text_context}
@@ -423,7 +449,6 @@ MANUAL SOURCE OF TRUTH:
         """
         MODE 5: Conversational Wizard Prompt.
         """
-        image_tags = "\n".join([f"  - [IMAGE_{i}] for image reference {i}" for i in range(len(image_references))])
         disclaimer = self._get_disclaimer() if missing_manual else ""
 
         return (
@@ -439,7 +464,10 @@ MANUAL SOURCE OF TRUTH:
             "YOUR MISSION CRITICAL TASK:\n"
             "1. READ HISTORY: Determine if we are in Safety (start here!) or Repair phase.\n"
             "2. STRUCTURE: Use a clear, structured format. Use bullet points for steps. No long paragraphs.\n"
-            "3. IMAGES (MANDATORY): You MUST interleave [IMAGE_N] tags (e.g. [IMAGE_0], [IMAGE_1]) directly into your steps at the EXACT point where the visual reference is most helpful. THIS IS A CRITICAL REQUIREMENT for operator safety. Do not just list them at the end. If an image shows a specific tool or component, match it to that step.\n"
+            "3. MATERIAL (MANDATORY): interleave the tags listed for you below (see AVAILABLE "
+            "MATERIAL) directly into your steps at the EXACT point where they are most helpful. "
+            "THIS IS A CRITICAL REQUIREMENT for operator safety. Do not just list them at the end. "
+            "If a diagram shows a specific tool or component, match it to that step.\n"
             "4. ADAPT: If they completed a step, provide the EXACT next step from the manual. Do not ask them what to do.\n"
             "5. FIELD WISDOM: If 'PAST INTERACTIONS' shows a successful previous fix for a similar issue on this machine, MENTION IT.\n"
             "6. RESPONSE STYLE: Professional, highly structured, and technical. Use bolding for emphasis.\n\n"
@@ -447,6 +475,5 @@ MANUAL SOURCE OF TRUTH:
             "page numbers in the context above, so the technician can check the original.\n"
             "OUTPUT FORMAT: Start with '[PHASE: <Name>]'.\n\n"
             "SAFETY MANDATE:\n"
-            "- IF CHAT HISTORY IS EMPTY: You MUST exclusively provide Safety and Preparation steps (PPE, LOTO, etc.) as the very first instruction. DO NOT skip to the actual repair task.\n\n"
-            f"AVAILABLE IMAGES:\n{image_tags}"
+            "- IF CHAT HISTORY IS EMPTY: You MUST exclusively provide Safety and Preparation steps (PPE, LOTO, etc.) as the very first instruction. DO NOT skip to the actual repair task.\n"
         )

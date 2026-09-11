@@ -160,6 +160,24 @@ function AssetBlock({
 export default function AnswerBubble({ message }: { message: ChatMessage }) {
   const [zoomed, setZoomed] = useState<string | null>(null);
 
+  // Shared between the user- and agent-message returns below (they return
+  // separate element trees), so a click-to-zoom on either kind of image works.
+  const zoomOverlay = zoomed && (
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-6"
+      onClick={() => setZoomed(null)}
+    >
+      <button
+        className="absolute right-6 top-6 rounded-full bg-slate-800 p-2 text-slate-300 hover:text-white"
+        aria-label="Close"
+        onClick={() => setZoomed(null)}
+      >
+        <X size={20} />
+      </button>
+      <img src={zoomed} alt="Enlarged" className="max-h-full max-w-full rounded-xl" />
+    </div>
+  );
+
   const { phase, segments } = useMemo(() => {
     if (message.role === "user") {
       return { phase: null, segments: [{ kind: "text", value: message.content }] as Segment[] };
@@ -175,14 +193,29 @@ export default function AnswerBubble({ message }: { message: ChatMessage }) {
 
   if (message.role === "user") {
     return (
-      <div className="flex justify-end gap-3">
-        <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-orange-600 px-4 py-3 text-sm font-medium text-white shadow-lg shadow-orange-900/20">
-          {message.content}
+      <>
+        <div className="flex justify-end gap-3">
+          <div className="flex max-w-[85%] flex-col items-end gap-2">
+            {/* A photo attached alongside the question — the user's own upload,
+                not one of the manual's figures, so no caption/kind chrome here. */}
+            {message.images?.[0] && (
+              <img
+                src={message.images[0]}
+                alt="Attached to your message"
+                onClick={() => setZoomed(message.images![0])}
+                className="max-h-56 w-auto cursor-zoom-in rounded-2xl border border-orange-400/30"
+              />
+            )}
+            <div className="rounded-2xl rounded-tr-sm bg-orange-600 px-4 py-3 text-sm font-medium text-white shadow-lg shadow-orange-900/20">
+              {message.content}
+            </div>
+          </div>
+          <div className="mt-1 h-8 w-8 shrink-0 rounded-full bg-slate-700 p-1.5">
+            <User size={20} className="text-slate-300" />
+          </div>
         </div>
-        <div className="mt-1 h-8 w-8 shrink-0 rounded-full bg-slate-700 p-1.5">
-          <User size={20} className="text-slate-300" />
-        </div>
-      </div>
+        {zoomOverlay}
+      </>
     );
   }
 
@@ -226,21 +259,7 @@ export default function AnswerBubble({ message }: { message: ChatMessage }) {
         </div>
       </div>
 
-      {zoomed && (
-        <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-6"
-          onClick={() => setZoomed(null)}
-        >
-          <button
-            className="absolute right-6 top-6 rounded-full bg-slate-800 p-2 text-slate-300 hover:text-white"
-            aria-label="Close"
-            onClick={() => setZoomed(null)}
-          >
-            <X size={20} />
-          </button>
-          <img src={zoomed} alt="Manual figure enlarged" className="max-h-full max-w-full rounded-xl" />
-        </div>
-      )}
+      {zoomOverlay}
     </div>
   );
 }

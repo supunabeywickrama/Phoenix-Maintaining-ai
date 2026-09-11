@@ -5,6 +5,7 @@ import { useDispatch, useSelector } from "react-redux";
 import { AppDispatch, RootState } from "../store/store";
 import {
   askAssistant,
+  askAssistantWithImage,
   fetchSessions,
   resolveSession,
   setIntent,
@@ -16,7 +17,16 @@ import MachineSelector from "../components/MachineSelector";
 import SessionSidebar from "../components/SessionSidebar";
 import AnswerBubble from "../components/AnswerBubble";
 import StepCard from "../components/StepCard";
-import { Send, Loader2, Flame, ClipboardCheck, FileDown, GraduationCap } from "lucide-react";
+import {
+  Send,
+  Loader2,
+  Flame,
+  ClipboardCheck,
+  FileDown,
+  GraduationCap,
+  Paperclip,
+  X,
+} from "lucide-react";
 
 const EXAMPLES: Record<ChatIntent, string[]> = {
   troubleshoot: [
@@ -46,7 +56,10 @@ export default function AskPage() {
   const [input, setInput] = useState("");
   const [fixText, setFixText] = useState("");
   const [showResolve, setShowResolve] = useState(false);
+  const [attachedImage, setAttachedImage] = useState<File | null>(null);
+  const [attachedPreview, setAttachedPreview] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -56,7 +69,30 @@ export default function AskPage() {
     const text = query.trim();
     if (!text || isAsking) return;
     setInput("");
+
+    if (attachedImage) {
+      const file = attachedImage;
+      clearAttachment();
+      dispatch(askAssistantWithImage({ query: text, file })).then(() => dispatch(fetchSessions()));
+      return;
+    }
     dispatch(askAssistant({ query: text, mode })).then(() => dispatch(fetchSessions()));
+  };
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file later
+    if (!file) return;
+    if (!file.type.startsWith("image/")) return;
+    if (attachedPreview) URL.revokeObjectURL(attachedPreview);
+    setAttachedImage(file);
+    setAttachedPreview(URL.createObjectURL(file));
+  };
+
+  const clearAttachment = () => {
+    if (attachedPreview) URL.revokeObjectURL(attachedPreview);
+    setAttachedImage(null);
+    setAttachedPreview(null);
   };
 
   const lastAgentIndex = (() => {
@@ -214,7 +250,42 @@ export default function AskPage() {
         </div>
 
         <div className="border-t border-slate-800 p-4">
+          {attachedPreview && (
+            <div className="mb-2 flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-950 p-2">
+              <img
+                src={attachedPreview}
+                alt="Attachment preview"
+                className="h-14 w-14 rounded-lg object-cover"
+              />
+              <div className="flex-1 text-xs text-slate-400">
+                Attached — ask a question about this photo below.
+              </div>
+              <button
+                onClick={clearAttachment}
+                aria-label="Remove attachment"
+                className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-800 hover:text-white"
+              >
+                <X size={16} />
+              </button>
+            </div>
+          )}
           <div className="flex items-end gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              hidden
+              onChange={handleFileSelect}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isAsking}
+              aria-label="Attach a photo"
+              title="Attach a photo to ask about"
+              className="rounded-xl border border-slate-700 p-3 text-slate-400 transition-colors hover:border-orange-500/40 hover:text-orange-400 disabled:opacity-40"
+            >
+              <Paperclip size={20} />
+            </button>
             <textarea
               rows={1}
               value={input}
@@ -225,7 +296,13 @@ export default function AskPage() {
                   send(input);
                 }
               }}
-              placeholder={intent === "learn" ? "Ask how something works…" : "Describe the problem…"}
+              placeholder={
+                attachedImage
+                  ? "What am I looking at? Is anything wrong with it?"
+                  : intent === "learn"
+                  ? "Ask how something works…"
+                  : "Describe the problem…"
+              }
               className="max-h-40 flex-1 resize-none rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-orange-500"
             />
             <button

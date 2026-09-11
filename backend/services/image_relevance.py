@@ -16,11 +16,19 @@ from services.llm_json import loads_tolerant
 CAPTION_PREVIEW = 400
 
 
-def verify_images(query: str, images: list, min_keep: int = 0) -> list:
+def verify_images(query: str, images: list, min_keep: int = 0, context_pages: set = None) -> list:
     """Return the subset of `images` genuinely useful for `query`.
 
     Fails open: if the judge errors or returns nothing usable, the original
     candidates are kept — a degraded judge shouldn't strip a correct diagram.
+
+    `context_pages`: the manual pages the answer's TEXT is actually grounded
+    on. Caught a real failure without this — asked about "Clutch Tests" (page
+    45, which has no diagram of its own), and the judge kept two Page 46
+    "Blade Drive" figures because they are structurally similar (both are
+    feeler-gauge/dial-indicator measurement diagrams) even though they
+    document a completely different test. Page distance from the answer's own
+    grounding is a much harder signal to fool than caption vibes alone.
     """
     if not images or not query.strip():
         return images
@@ -32,16 +40,29 @@ def verify_images(query: str, images: list, min_keep: int = 0) -> list:
         caption = (getattr(img, "content", "") or "").strip().replace("\n", " ")
         listing.append(f"{i}: (page {getattr(img, 'page', '?')}) {caption[:CAPTION_PREVIEW]}")
 
+    pages_note = ""
+    if context_pages:
+        pages_note = (
+            f"\nThe answer's own text is drawn from manual page(s): {sorted(context_pages)}. "
+            "A figure from one of these pages, or clearly about the same named test/procedure/"
+            "component, is a strong match. A figure from a DIFFERENT page that merely LOOKS "
+            "structurally similar (e.g. another test that also uses a feeler gauge or dial "
+            "indicator, a different numbered Test/Figure) is very likely a different procedure - "
+            "drop it even though it superficially resembles what was asked about.\n"
+        )
+
     prompt = (
         "A maintenance technician asked:\n"
-        f"  \"{query}\"\n\n"
+        f"  \"{query}\"\n"
+        f"{pages_note}\n"
         "These figures from the machine's manual are candidates to show alongside the answer. "
         "Each line is an index and that figure's description.\n\n"
         + "\n".join(listing)
         + "\n\nReturn JSON: {\"keep\": [indices]} listing ONLY the figures that would actually help "
-        "this technician with this question — the components, assemblies or procedures they asked "
-        "about. Exclude figures about unrelated parts of the machine. If none are relevant, "
-        "return an empty array."
+        "this technician with THIS SPECIFIC question — the exact components, assemblies or "
+        "procedures they asked about, not merely a similar-looking test elsewhere in the manual. "
+        "Exclude figures about unrelated parts, tests or pages of the machine. If none are "
+        "relevant, return an empty array — an empty result is correct when nothing actually matches."
     )
 
     try:

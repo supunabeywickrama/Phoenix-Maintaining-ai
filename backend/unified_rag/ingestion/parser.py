@@ -48,6 +48,9 @@ def _df_to_markdown(df) -> str:
         return ""
 
 
+from services.table_validator import is_valid_table
+
+
 class DocumentParser:
     def __init__(self, yolo_weights="models/yolov8_doclaynet.pt"):
         self.cloudinary = CloudinaryService()
@@ -106,7 +109,16 @@ class DocumentParser:
             page_idx = page_num + 1
             print(f"   ∟ Processing Page {page_idx}/{total_pages}...")
             page = doc.load_page(page_num)
-            
+
+            # Full page text, independent of the YOLO-detected text blocks used
+            # for chunking below. Captions are grounded against this so a vision
+            # model describing a diagram cannot invent a different machine or
+            # power source than what the manual itself states on the same page
+            # (caught this for real: a diagram was captioned "pneumatic
+            # reciprocating saw" when the manual's own text on that page reads
+            # "TPM-750 Petrol ... two-stroke ... Pruning Machine").
+            page_text = page.get_text("text").strip()
+
             # Step 1: Layout Detection
             pix = page.get_pixmap(dpi=150)
             img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
@@ -159,8 +171,25 @@ class DocumentParser:
                         # The whole figure is always stored, even when it splits
                         # cleanly: an explanation should show the full drawing for
                         # orientation before zooming into one component.
-                        fh, fw = raw_crop.shape[:2]
-                        _, buf = cv2.imencode(".png", raw_crop)
+                        #
+                        # Re-rendered at higher DPI specifically for this upload:
+                        # 150 DPI (used for layout detection) is fine for finding
+                        # where a figure is, but a dense composite drawing with a
+                        # dozen small circled callout numbers needs more than
+                        # that to stay legible to the vision model captioning it.
+                        # SAM splitting below still uses the original low-res
+                        # raw_crop - its geometry doesn't need the extra detail.
+                        try:
+                            hi_pix = page.get_pixmap(clip=rect, dpi=300)
+                            hi_arr = np.frombuffer(hi_pix.samples, dtype=np.uint8).reshape(
+                                hi_pix.height, hi_pix.width, 3
+                            )
+                            full_crop = cv2.cvtColor(hi_arr, cv2.COLOR_RGB2BGR)
+                        except Exception:
+                            full_crop = raw_crop
+
+                        fh, fw = full_crop.shape[:2]
+                        _, buf = cv2.imencode(".png", full_crop)
                         full_url = self.cloudinary.upload_image(
                             io.BytesIO(buf.tobytes()), f"{manual_id}_p{page_idx}_fig{img_index}"
                         )
@@ -174,6 +203,7 @@ class DocumentParser:
                                     "section": current_section,
                                     "label": "Full Diagram",
                                     "figure_role": "full",
+                                    "page_text": page_text,
                                 },
                             })
                         else:
@@ -201,6 +231,7 @@ class DocumentParser:
                                         "label": sub["label"],
                                         "parent_context": parent_ctx,
                                         "figure_role": "part",
+                                        "page_text": page_text,
                                     },
                                 })
                                 print(f"         Isolated component: {sub['label']} ({sw}x{sh})")
@@ -240,7 +271,9 @@ class DocumentParser:
                         continue
                     for i, table in enumerate(tables):
                         df = table.df
-                        if df.empty or df.shape[0] < 2 or df.shape[1] < 2:
+                        ok, why = is_valid_table(df, flavor=flavor)
+                        if not ok:
+                            print(f"      [TableValidator] Rejected {flavor} table on page {page_idx}: {why}")
                             continue
                         parsed_data.append({
                             "type": "table", "page": page_idx,

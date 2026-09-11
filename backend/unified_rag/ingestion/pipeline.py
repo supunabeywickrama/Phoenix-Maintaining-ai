@@ -55,9 +55,17 @@ async def process_manual_async(file_path: str, manual_id: str):
             chunk["metadata"] = meta
         elif chunk["type"] == "table":
             ctx = chunk.get("metadata", {}).get("section", "Technical Data")
-            chunk["content"] = await asyncio.to_thread(
+            summary = await asyncio.to_thread(
                 tabler.summarize_table, chunk["content"], ctx
             )
+            # The header is written here, not by the LLM: rag.py's _title_of()
+            # takes the first line of the content as the display title, and an
+            # LLM asked to open its own summary tends to invent a plausible
+            # manual-style heading ("Figure 1.7: ...") for a table that has no
+            # real one. A deterministic header can't hallucinate.
+            # Page is not repeated here: it is already carried on the chunk's own
+            # `page` column and shown separately everywhere this title is used.
+            chunk["content"] = f"### Table — {ctx}\n\n{summary}"
         return chunk
 
     sem = asyncio.Semaphore(10)  # Limit concurrent API calls

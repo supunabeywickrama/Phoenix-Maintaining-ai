@@ -115,6 +115,47 @@ export const askAssistant = createAsyncThunk<
   });
 });
 
+interface AskWithImageResponse {
+  role: "agent";
+  content: string;
+  session_id: number;
+  machine_id: string | null;
+  manual_id: string | null;
+  user_image: string | null;
+  intent: ChatIntent | null;
+  context_source: string;
+  timestamp: string;
+}
+
+/**
+ * Ask about a photo or diagram attached directly in chat — a technician's own
+ * phone photo of a leak or a damaged part, not one of the manual's own figures
+ * (those already flow through ingestion and ordinary retrieval).
+ *
+ * A separate endpoint/thunk from askAssistant rather than an optional image on
+ * it: the backend can't mix a JSON body with a file upload on one route, so
+ * this posts FormData instead.
+ */
+export const askAssistantWithImage = createAsyncThunk<
+  AskWithImageResponse,
+  { query: string; file: File },
+  { state: { assistant: AssistantState } }
+>("assistant/askWithImage", async ({ query, file }, { getState }) => {
+  const { activeSessionId, selectedMachineId, intent } = getState().assistant;
+  const form = new FormData();
+  form.append("query", query);
+  form.append("image", file);
+  if (activeSessionId) form.append("session_id", String(activeSessionId));
+  if (selectedMachineId) form.append("machine_id", selectedMachineId);
+  // Only sent on the first turn; afterwards the session carries it server-side.
+  if (!activeSessionId && intent) form.append("intent", intent);
+
+  return apiFetch<AskWithImageResponse>("/api/assistant/ask-with-image", {
+    method: "POST",
+    body: form,
+  });
+});
+
 export const fetchSessions = createAsyncThunk("assistant/fetchSessions", async () =>
   apiFetch<SessionSummary[]>("/api/assistant/sessions")
 );
@@ -217,6 +258,42 @@ const assistantSlice = createSlice({
         state.messages.push({
           role: "agent",
           content: `Could not answer that: ${state.error}`,
+          images: [],
+          timestamp: new Date().toISOString(),
+          isError: true,
+        });
+      })
+      .addCase(askAssistantWithImage.pending, (state, action) => {
+        state.isAsking = true;
+        state.error = null;
+        // Local preview via object URL while the upload is in flight — swapped
+        // for nothing on success since the server echoes the same image back
+        // in session history on reload anyway.
+        state.messages.push({
+          role: "user",
+          content: action.meta.arg.query,
+          images: [URL.createObjectURL(action.meta.arg.file)],
+          timestamp: new Date().toISOString(),
+        });
+      })
+      .addCase(askAssistantWithImage.fulfilled, (state, action) => {
+        state.isAsking = false;
+        state.activeSessionId = action.payload.session_id;
+        state.contextSource = action.payload.context_source;
+        if (action.payload.intent) state.intent = action.payload.intent;
+        state.messages.push({
+          role: "agent",
+          content: action.payload.content,
+          images: [],
+          timestamp: action.payload.timestamp,
+        });
+      })
+      .addCase(askAssistantWithImage.rejected, (state, action) => {
+        state.isAsking = false;
+        state.error = action.error.message || "Image analysis failed";
+        state.messages.push({
+          role: "agent",
+          content: `Could not analyze that image: ${state.error}`,
           images: [],
           timestamp: new Date().toISOString(),
           isError: true,
