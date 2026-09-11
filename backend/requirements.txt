@@ -14,9 +14,13 @@ python-multipart          # required for PDF uploads (not imported directly)
 python-dotenv
 
 # ── Database ──────────────────────────────────────────────────────────────────
+# Postgres: relational data only (manuals, machines, sessions, messages).
 sqlalchemy
 psycopg2-binary           # Postgres driver used by SQLAlchemy
-pgvector
+pgvector                  # legacy read path only — scripts/migrate_to_qdrant.py
+
+# Qdrant: vector search (manual_chunks, interaction_memory) — replaces pgvector
+qdrant-client
 
 # ── LLM / embeddings (Qwen over the OpenAI-compatible DashScope endpoint) ─────
 openai>=2.30.0

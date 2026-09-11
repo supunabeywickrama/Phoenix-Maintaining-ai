@@ -25,15 +25,19 @@ from pydantic import BaseModel
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from unified_rag.ai_client import get_client, chat_text, MODEL_CHAT, MODEL_CHAT_LIGHT, MODEL_VISION
+from unified_rag.ai_client import (
+    get_client, chat_text, chat_json, MODEL_CHAT, MODEL_CHAT_LIGHT, MODEL_VISION,
+)
+from unified_rag.embeddings.embedder import embedder
+from services.llm_json import loads_tolerant
 from unified_rag.config import settings
 from unified_rag.db.database import SessionLocal
 from unified_rag.db.models import (
     AssistantMessage,
     AssistantSession,
     Machine,
-    ManualChunk,
 )
+from unified_rag.db import qdrant_store
 from unified_rag.retrieval.rag import RAGGenerator, RAGMode
 from services.cloudinary_service import CloudinaryService
 from services.incident_summarizer import summarize_and_archive
@@ -127,6 +131,120 @@ def _generate_title(query: str) -> str:
         return query[:60] or "New enquiry"
 
 
+# An uploaded diagram is matched against the manual's own indexed figures before
+# anything is said about it. Above STRONG we name the manual figure as the same
+# drawing; between POSSIBLE and STRONG it is offered as the closest thing found
+# and flagged as unconfirmed; below POSSIBLE nothing is claimed at all.
+FIGURE_MATCH_STRONG = 0.55
+FIGURE_MATCH_POSSIBLE = 0.38
+
+
+def _describe_uploaded_image(image_b64: str) -> dict:
+    """Structured read of the user's image: what it is, and which callout codes
+    are printed on it. Deliberately does NOT ask what the numbers mean — that
+    is what the manual's legend is for, and guessing it is the single biggest
+    source of confident, wrong answers about a numbered diagram."""
+    prompt = (
+        "Look at this image from a technical manual and return JSON with exactly these keys:\n"
+        '  "kind": one of "diagram", "schematic", "chart", "flowchart", "exploded_view", '
+        '"photo", "table".\n'
+        '  "component": short name of the main thing shown (3-6 words), based ONLY on shapes '
+        "and any printed text you can actually read.\n"
+        '  "codes": array of every numbered/coded callout printed on the image, as strings, '
+        'in order (e.g. ["1","2","3"]). Scan the whole image; do not stop early.\n'
+        '  "visible_text": array of any words actually printed on the image (labels, drawing '
+        'numbers like "CA-0601", dimensions).\n'
+        '  "description": 60-120 words describing the LAYOUT and what is drawn - shapes, how '
+        "they connect, left to right. Describe the geometry, not the identity of numbered "
+        "parts.\n\n"
+        "CRITICAL: a bare number on a leader line does not tell you what that part is. Never "
+        "state that a number 'is' a particular component. Report the numbers in \"codes\" and "
+        "leave their meaning to the manual."
+    )
+    try:
+        raw = chat_json(MODEL_VISION, prompt, image_b64=image_b64, max_tokens=1200, temperature=0.0)
+        data = loads_tolerant(raw) if raw else None
+    except Exception as e:
+        logger.warning("Uploaded-image description failed: %s", e)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "kind": str(data.get("kind") or "diagram"),
+        "component": str(data.get("component") or "").strip(),
+        "codes": [str(c).strip() for c in (data.get("codes") or []) if str(c).strip()],
+        "visible_text": [str(t).strip() for t in (data.get("visible_text") or []) if str(t).strip()],
+        "description": str(data.get("description") or "").strip(),
+    }
+
+
+def _match_uploaded_figure(manual_id: str, desc: dict) -> dict:
+    """Find the manual's own figure that the uploaded image most resembles, and
+    pull in that figure's legend table.
+
+    This is the difference between "an LLM looks at a picture and speculates"
+    and "we located this exact drawing in your manual and can read its key":
+    the matched figure's stored caption and legend are real manual content, so
+    the numbers get their true meanings instead of invented ones.
+    """
+    if not manual_id:
+        return {}
+    probe = " ".join(filter(None, [
+        desc.get("component", ""),
+        " ".join(desc.get("visible_text") or []),
+        desc.get("description", ""),
+    ])).strip()
+    if not probe:
+        return {}
+
+    try:
+        emb = embedder.embed_text(probe)
+        hits = qdrant_store.search_manual_chunks(
+            emb, manual_id=manual_id, types=["image"], limit=5
+        )
+    except Exception as e:
+        logger.warning("Figure match lookup failed: %s", e)
+        return {}
+
+    hits = [h for h in hits if h.path]
+    if not hits:
+        return {}
+    best = hits[0]
+    score = best.relevance or 0.0
+    if score < FIGURE_MATCH_POSSIBLE:
+        return {}
+
+    # Look the legend up with the codes read off the UPLOADED image, not the
+    # ones resolved for the stored figure at ingestion time. The upload is the
+    # thing being asked about, its numbers are right there in the picture, and
+    # this path then works even for manuals ingested before callout resolution
+    # was fixed.
+    legend = None
+    try:
+        codes = desc.get("codes") or []
+        legend = _rag.retriever.find_legend_table(manual_id, best.page, codes)
+        legend_near = legend is not None
+        if legend is None:
+            # Nothing near the figure — sweep the whole manual, under a much
+            # stricter bar (see find_legend_table_anywhere). A table found this
+            # way shares the figure's item numbers but NOT its page, so it may
+            # belong to a different drawing; the caller must present it as
+            # unconfirmed rather than as this figure's key.
+            legend = _rag.retriever.find_legend_table_anywhere(manual_id, codes)
+    except Exception as e:
+        logger.warning("Legend lookup for matched figure failed: %s", e)
+
+    return {
+        "figure": best,
+        "score": score,
+        "confident": score >= FIGURE_MATCH_STRONG,
+        "legend": legend,
+        # False when the key was found by sweeping the whole manual rather than
+        # on a page beside the figure — same numbers, unproven connection.
+        "legend_near": legend_near if legend is not None else False,
+    }
+
+
 def _absolute_image_urls(paths: List[str]) -> List[str]:
     """
     Figures are uploaded to Cloudinary during ingestion, so `path` is normally
@@ -157,7 +275,7 @@ def _resolve_manual(db: Session, machine_id: Optional[str], manual_id: Optional[
 
 
 def _has_content(db: Session, manual_id: str) -> int:
-    return db.query(ManualChunk).filter(ManualChunk.manual_id == manual_id).count()
+    return qdrant_store.count_manual_chunks(manual_id)
 
 
 def _original_topic(db: Session, session_id: int) -> Optional[str]:
@@ -484,10 +602,82 @@ async def ask_with_image(
                 logger.warning("Manual context lookup failed for image question: %s", e)
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    # Read the upload, then find it in the manual. Doing this BEFORE the answer
+    # is what stops the model speculating about numbered callouts: if the same
+    # drawing is indexed, its real caption and legend are available as fact.
+    desc = _describe_uploaded_image(b64)
+    match = _match_uploaded_figure(resolved_manual_id, desc) if desc else {}
+
+    upload_block = ""
+    if desc:
+        codes = ", ".join(desc.get("codes") or []) or "none detected"
+        seen = ", ".join(desc.get("visible_text") or []) or "none"
+        upload_block = (
+            "WHAT THE ATTACHED IMAGE CONTAINS (read from the image itself):\n"
+            f"- Appears to be: {desc.get('component') or 'unidentified'} ({desc.get('kind')})\n"
+            f"- Callout numbers printed on it: {codes}\n"
+            f"- Text printed on it: {seen}\n"
+            f"- Layout: {desc.get('description')}\n\n"
+        )
+
+    match_block = ""
+    attachments: List[Dict[str, Any]] = []
+    if match:
+        fig = match["figure"]
+        confident = match["confident"]
+        legend = match.get("legend")
+        match_block = (
+            ("MATCHING FIGURE IN THIS MANUAL — this is the same drawing, and the "
+             "description below is the manual's own, so prefer it over your own reading "
+             "of the image:\n"
+             if confident else
+             "CLOSEST FIGURE FOUND IN THIS MANUAL — this is a probable, NOT confirmed, "
+             "match. Say so, and only use it if it genuinely corresponds to what is in "
+             "the attached image:\n")
+            + f"(page {fig.page}, similarity {match['score']:.2f})\n{fig.content}\n\n"
+        )
+        attachments.append({
+            "tag": "IMAGE_0", "type": "image",
+            "kind": getattr(fig, "kind", None) or "diagram",
+            "role": getattr(fig, "figure_role", None) or "full",
+            "title": f"Manual figure, page {fig.page}",
+            "page": fig.page,
+            "url": _absolute_image_urls([fig.path])[0] if fig.path else None,
+        })
+        if legend is not None and getattr(legend, "render_markdown", None):
+            if match.get("legend_near"):
+                match_block += (
+                    "LEGEND / KEY FOR THAT FIGURE (printed beside the figure) — this is the "
+                    "ONLY authoritative source for what each callout number means:\n"
+                    f"{legend.render_markdown}\n\n"
+                )
+            else:
+                # Found by sweeping the manual: same item numbers, but not
+                # printed with this figure, so it may key a different drawing.
+                match_block += (
+                    f"POSSIBLE KEY, from page {legend.page} — it uses the same item numbers as "
+                    "the attached image, but it is NOT printed beside this figure and may "
+                    "belong to a different drawing. You may offer it as a lead, but you MUST "
+                    "say it is unconfirmed and must NOT state its names as this figure's "
+                    f"parts:\n{legend.render_markdown}\n\n"
+                )
+            attachments.append({
+                "tag": "TABLE_0", "type": "table", "kind": "table", "role": None,
+                "title": (
+                    (((legend.content or "").splitlines() or [""])[0][:70])
+                    or f"Key, page {legend.page}"
+                ) + ("" if match.get("legend_near") else " (unconfirmed)"),
+                "page": legend.page,
+                "markdown": legend.render_markdown,
+            })
+
     system_prompt = (
         "You are a maintenance engineer helping a technician who has just attached a photo or "
         "diagram in chat.\n"
         f"CONVERSATION SO FAR:\n{history_text}\n\n"
+        + upload_block
+        + match_block
         + (
             f"RELEVANT MANUAL TEXT (page-cited background — use it if it applies to what is in "
             f"the photo, ignore it if it does not):\n{manual_context}\n\n"
@@ -503,7 +693,16 @@ async def ask_with_image(
         "do not invent a part number or value that is not there.\n"
         "4. If the image is unclear, blurry, or does not show enough to answer, say exactly what "
         "additional photo or angle would help, rather than guessing.\n"
-        "5. Cite the manual page as (page N) when you use it."
+        "5. Cite the manual page as (page N) when you use it.\n"
+        "6. NUMBERED CALLOUTS — THE RULE THAT MATTERS MOST HERE: a number on a leader line does "
+        "not tell you what the part is. If a LEGEND is given above, use it and only it: say "
+        "'(3) clutch housing' because the key says so. If there is NO legend above, you MUST "
+        "NOT assign meanings — list the numbers you can see and say plainly that the key for "
+        "this figure is not in the indexed manual, and ask which page the key is on. Writing "
+        "'11 is the blade cap' from the shape of a drawing is a fabrication, even when it "
+        "sounds reasonable.\n"
+        "7. Do not narrate your reasoning. Give the answer directly, with no preamble about "
+        "what you are about to do."
     )
 
     try:
@@ -518,6 +717,7 @@ async def ask_with_image(
     db.add(AssistantMessage(
         session_id=session.id, role="agent", content=answer,
         type="text", timestamp=_now(),
+        attachments=json.dumps(attachments) if attachments else None,
     ))
     session.updated_at = _now()
     db.commit()
@@ -529,11 +729,17 @@ async def ask_with_image(
         "machine_id": resolved_machine_id,
         "manual_id": resolved_manual_id,
         "user_image": user_images[0] if user_images else None,
-        "images": [],
-        "attachments": [],
+        "images": [a["url"] for a in attachments if a.get("type") == "image" and a.get("url")],
+        "attachments": attachments,
         "mode": "answer",
         "intent": session.intent,
         "context_source": (
+            # Naming the matched figure is the point of the feature: the
+            # technician should see WHICH manual drawing this was read against,
+            # not just that "a manual" was consulted.
+            f"Manual: {resolved_manual_id} · matched figure on page {match['figure'].page}"
+            f"{'' if match['confident'] else ' (probable match)'}"
+            if match else
             f"Manual: {resolved_manual_id}" if manual_context
             else "Photo analysis (no manual context)"
         ),

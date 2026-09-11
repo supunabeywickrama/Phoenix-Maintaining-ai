@@ -1,13 +1,22 @@
 """
 Phoenix Industries schema.
 
-Six tables — the knowledge side of the platform only. The sensor/ML tables from
-the Zynaptrix product (AnomalyRecord, ChatMessage, SensorConfiguration,
-AnomalyThreshold, MachineAsset, MachineEvaluation) are deliberately absent:
-Phoenix has no telemetry in scope, so nothing writes or reads them.
+Relational tables only — vector search moved to Qdrant (see
+unified_rag/db/qdrant_store.py), since Postgres has no reason to hold the
+sessions/messages/machines data ManualChunk and InteractionMemory used to sit
+next to. Those two classes are kept below, unused by application code, purely
+as a read-only migration source: scripts/migrate_to_qdrant.py reads their
+already-computed embeddings straight out of pgvector rather than re-paying to
+re-embed everything, and their data is left in place as a rollback path until
+Qdrant is confirmed working. Safe to drop both tables once that's verified.
+
+The sensor/ML tables from the Zynaptrix product (AnomalyRecord, ChatMessage,
+SensorConfiguration, AnomalyThreshold, MachineAsset, MachineEvaluation) are
+deliberately absent: Phoenix has no telemetry in scope, so nothing writes or
+reads them.
 
 Machine is kept even though Phoenix has no sensors, because it is what scopes a
-question to a manual and gives InteractionMemory something to hang past fixes on.
+question to a manual and gives interaction memory something to hang past fixes on.
 """
 from sqlalchemy import Column, Integer, String, Text, ForeignKey
 from pgvector.sqlalchemy import Vector
@@ -15,7 +24,9 @@ from unified_rag.db.database import Base
 
 
 class ManualChunk(Base):
-    """One retrievable unit of a manual: a passage, a table summary, or a figure caption."""
+    """LEGACY / READ-ONLY — superseded by Qdrant's manual_chunks collection.
+    Nothing in the app writes here anymore; kept only so the migration script
+    can read out already-computed embeddings. See module docstring."""
     __tablename__ = "manual_chunks"
     __table_args__ = {'extend_existing': True}
 
@@ -74,12 +85,9 @@ class Machine(Base):
 
 
 class InteractionMemory(Base):
-    """
-    A fix that actually worked, written when a technician resolves a session.
-
-    RetrievalEngine.retrieve() queries this alongside the manual, so a repair
-    that succeeded once is surfaced the next time the same machine is asked about.
-    """
+    """LEGACY / READ-ONLY — superseded by Qdrant's interaction_memory
+    collection. Nothing in the app writes here anymore; kept only so the
+    migration script can read out already-computed embeddings."""
     __tablename__ = "interaction_memory"
     __table_args__ = {'extend_existing': True}
 

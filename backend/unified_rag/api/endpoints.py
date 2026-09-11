@@ -20,7 +20,8 @@ from sqlalchemy.orm import Session
 
 from unified_rag.ingestion.pipeline import process_manual_async
 from unified_rag.db.database import SessionLocal
-from unified_rag.db.models import Manual, ManualChunk, Machine
+from unified_rag.db.models import Manual, Machine
+from unified_rag.db import qdrant_store as qs
 
 router = APIRouter()
 
@@ -99,17 +100,12 @@ async def ingest_manual(
     # leaving the old ones to compete in retrieval. Updating a manual means
     # replacing its knowledge, so clear it first.
     if replace:
-        db = SessionLocal()
         try:
-            removed = db.query(ManualChunk).filter(ManualChunk.manual_id == manual_id).delete()
-            db.commit()
+            removed = qs.delete_manual_chunks(manual_id)
             if removed:
                 print(f"♻️ [API] Replacing {manual_id}: cleared {removed} existing chunks.")
         except Exception as e:
-            db.rollback()
             print(f"⚠️ [API] Could not clear existing chunks for {manual_id}: {e}")
-        finally:
-            db.close()
 
     # Parsing needs a real filesystem path (Camelot has no in-memory API), so use
     # a momentary OS-tempdir file that the background task deletes when finished.
@@ -145,8 +141,20 @@ async def _run_ingestion(tmp_path: str, manual_id: str) -> None:
     """Execute the ingestion pipeline outside the request/response cycle."""
     try:
         result = await process_manual_async(tmp_path, manual_id)
-        _set_job(manual_id, status="success", chunks=result.get("chunks"), error=None)
-        print(f"🏁 [API] Ingestion successful for {manual_id}!")
+        # "partial" is reported distinctly from "success": chunks that failed to
+        # embed or store are missing from the index, and an operator asking a
+        # question about the very page that dropped out deserves to know the
+        # manual went in incomplete rather than silently getting no answer.
+        _set_job(
+            manual_id,
+            status=result.get("status", "success"),
+            chunks=result.get("chunks"),
+            failed=result.get("failed", 0),
+            failure_samples=result.get("failure_samples") or [],
+            error=None,
+        )
+        print(f"🏁 [API] Ingestion finished for {manual_id} "
+              f"({result.get('chunks')} chunks, {result.get('failed', 0)} failed)!")
     except Exception as e:
         print(f"🔥 [API] CRITICAL ERROR during ingestion: {e}")
         import traceback
@@ -191,11 +199,7 @@ async def list_manuals(db: Session = Depends(get_db)):
     Includes manual_ids present only as chunks (ingested before the Manual row
     existed, or whose PDF upload failed) so the UI never hides usable knowledge.
     """
-    counts = dict(
-        db.query(ManualChunk.manual_id, func.count(ManualChunk.id))
-        .group_by(ManualChunk.manual_id)
-        .all()
-    )
+    counts = qs.count_all_manual_chunks()
 
     manuals = {
         m.manual_id: ManualSummary(
@@ -244,7 +248,7 @@ async def delete_manual(manual_id: str, db: Session = Depends(get_db)):
     caller decides whether to relink or delete them, since a machine outliving
     its manual is a real situation on the floor.
     """
-    chunks = db.query(ManualChunk).filter(ManualChunk.manual_id == manual_id).delete()
+    chunks = qs.delete_manual_chunks(manual_id)
     record = db.query(Manual).filter(Manual.manual_id == manual_id).first()
     if record:
         db.delete(record)
@@ -277,12 +281,10 @@ async def rename_manual(manual_id: str, req: RenameRequest, db: Session = Depend
     if new_id == manual_id:
         return {"status": "unchanged", "manual_id": manual_id}
 
-    if db.query(Manual).filter(Manual.manual_id == new_id).first() or        db.query(ManualChunk).filter(ManualChunk.manual_id == new_id).first():
+    if db.query(Manual).filter(Manual.manual_id == new_id).first() or qs.count_manual_chunks(new_id):
         raise HTTPException(status_code=409, detail=f"Manual '{new_id}' already exists.")
 
-    chunks = db.query(ManualChunk).filter(ManualChunk.manual_id == manual_id).update(
-        {ManualChunk.manual_id: new_id}
-    )
+    chunks = qs.rename_manual_chunks(manual_id, new_id)
     machines = db.query(Machine).filter(Machine.manual_id == manual_id).update(
         {Machine.manual_id: new_id}
     )

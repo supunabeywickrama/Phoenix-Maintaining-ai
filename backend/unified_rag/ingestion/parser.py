@@ -1,6 +1,7 @@
 import fitz  # PyMuPDF
 import io
 import logging
+import re
 import numpy as np
 import cv2
 from PIL import Image
@@ -46,6 +47,109 @@ def _df_to_markdown(df) -> str:
     except Exception as e:
         print(f"      [Parser] Could not render table as markdown: {e}")
         return ""
+
+
+_CAPTION_RE = re.compile(
+    # "table" alone would also match a "Table of Contents" heading, hence the
+    # required digit after it; the others are specific enough on their own.
+    r"^(key to fig(?:ure)?\.?\s*\d|legend\b|parts?\s*list\b|table\s*\d)", re.IGNORECASE
+)
+
+
+def _guess_table_caption(page_text: str) -> str:
+    """First line on the page that reads like a table/legend heading, e.g.
+    'Key to Figure 1.1'. Camelot only returns the grid, never the caption
+    printed above it, so without this every table's title defaults to
+    'Table on page N' and a parts-legend can't be told apart from any other
+    grid on the same page."""
+    for line in (page_text or "").splitlines():
+        line = line.strip()
+        if line and _CAPTION_RE.match(line):
+            return line[:100]
+    return ""
+
+
+def _looks_like_legend(df) -> bool:
+    """True when the first data column is a run of small integers - the
+    'Item 1, Item 2, ...' shape a figure key has.
+
+    A page often prints a "Key to Figure 1.1" heading above the legend AND a
+    second, unrelated table (engine specs, torque figures) below it. Without
+    this check the heading gets stamped on both, and the spec table shows up
+    in chat titled "Key to Figure 1.1" - confirmed in real ingested data.
+    """
+    try:
+        rows = df.fillna("").astype(str).values.tolist()[1:]
+        if len(rows) < 3:
+            return False
+        ints = sum(
+            1 for r in rows
+            if r and r[0].strip().isdigit() and 0 < int(r[0].strip()) < 200
+        )
+        return ints >= max(3, len(rows) // 2)
+    except Exception:
+        return False
+
+
+def _header_title(df) -> str:
+    """A title built from the table's own header row. Deterministic on
+    purpose: an LLM asked to title a table invents manual-style headings
+    ("Figure 1.7: ...") that the manual never printed."""
+    try:
+        header = [c.strip().replace("\n", " ")
+                  for c in df.fillna("").astype(str).values.tolist()[0]]
+        seen, uniq = set(), []
+        for h in header:
+            if h and not h.isdigit() and h.lower() not in seen:
+                seen.add(h.lower())
+                uniq.append(h)
+        return " / ".join(uniq[:4])[:80] if len(uniq) >= 2 else ""
+    except Exception:
+        return ""
+
+
+def _table_title(df, caption: str, section: str) -> str:
+    """Caption if it genuinely belongs to this table, else the table's own
+    header row, else the section we're in (the old behaviour, kept last
+    because `current_section` leaks across everything on the page)."""
+    if caption:
+        is_legend_caption = bool(
+            re.match(r"^(key to fig|legend|parts?\s*list)", caption, re.IGNORECASE)
+        )
+        if not is_legend_caption or _looks_like_legend(df):
+            return caption
+    return _header_title(df) or section
+
+
+def _df_to_text(df, caption: str = "") -> str:
+    """Flatten a table into readable 'Header: value' lines instead of a raw
+    JSON dump. This becomes the chunk's embedded/searched content (and its
+    displayed title, via the first line) - a legend table only helps someone
+    ask "what is item 3" if the numbers and names it pairs are actually
+    readable text, not `{"0":{"0":"1",...}}`.
+    """
+    try:
+        rows = df.fillna("").astype(str).values.tolist()
+        if not rows:
+            return caption
+        header = [c.strip().replace("\n", " ") or f"Col {i+1}" for i, c in enumerate(rows[0])]
+        lines = [caption] if caption else []
+        for r in rows[1:]:
+            pairs = [
+                f"{h}: {v.strip()}" for h, v in zip(header, r)
+                if v and v.strip() and not h.lower().startswith("col ")
+            ]
+            if not pairs:
+                # Header row itself is unlabeled (common for these grids) -
+                # fall back to raw cell values so nothing is silently dropped.
+                pairs = [v.strip() for v in r if v and v.strip()]
+            if pairs:
+                lines.append(" | ".join(pairs))
+        text = "\n".join(lines).strip()
+        return text or caption
+    except Exception as e:
+        print(f"      [Parser] Could not flatten table to text: {e}")
+        return caption
 
 
 from services.table_validator import is_valid_table
@@ -128,8 +232,25 @@ class DocumentParser:
                 results = self.layout_model(Image.fromarray(img_array), verbose=False)
                 boxes = results[0].boxes
                 names = self.layout_model.names
-                
+
                 img_index = 0
+                # Per-page state for the two fixes below - reset every page.
+                # 1) seen_text_on_page: the layout model's per-class NMS does not
+                #    suppress overlapping boxes of DIFFERENT classes, so the same
+                #    paragraph sometimes gets detected as both "Text" and
+                #    "List-item" and extracted twice, verbatim. Confirmed in real
+                #    data: ~4% of text chunks across a real manual were exact
+                #    (page, content) duplicates.
+                # 2) short_fragments: a table-of-contents or index page is a
+                #    cluster of many small "Text"/"List-item" boxes, one per
+                #    heading, each with no body content of its own. Storing each
+                #    as its own chunk let a bare 4-word TOC entry like "Test 4 -
+                #    Testing the Clutch" out-rank the real 150-word procedure on
+                #    its own page in vector search, since the fragment is a
+                #    near-exact phrase match with none of the surrounding noise a
+                #    real answer has. Buffered here and merged into one chunk.
+                seen_text_on_page = set()
+                short_fragments = []
                 for box in boxes:
                     cls_id = int(box.cls[0].item())
                     class_name = names[cls_id].lower()
@@ -240,14 +361,46 @@ class DocumentParser:
 
                         img_index += 1
                         
-                    # TEXT 
+                    # TEXT
                     elif "text" in class_name or "list" in class_name:
                         text_content = page.get_text("text", clip=rect).strip()
-                        if text_content:
+                        if not text_content:
+                            continue
+
+                        dedup_key = text_content.lower()
+                        if dedup_key in seen_text_on_page:
+                            continue
+                        seen_text_on_page.add(dedup_key)
+
+                        words = text_content.split()
+                        looks_like_toc_entry = (
+                            len(text_content) < 60 and len(words) <= 6
+                            and not text_content.rstrip().endswith((".", "!", "?", ":"))
+                        )
+                        if looks_like_toc_entry:
+                            short_fragments.append(text_content)
+                        else:
                             parsed_data.append({
                                 "type": "text", "content": text_content, "page": page_idx,
                                 "metadata": {"section": current_section}
                             })
+
+                # Flush buffered short fragments. 3+ on one page is the TOC/index
+                # signature; fewer than that could be a genuine short standalone
+                # note, so those are kept as individual chunks as before.
+                if len(short_fragments) >= 3:
+                    parsed_data.append({
+                        "type": "text",
+                        "content": "Page contents: " + " | ".join(short_fragments),
+                        "page": page_idx,
+                        "metadata": {"section": current_section},
+                    })
+                else:
+                    for frag in short_fragments:
+                        parsed_data.append({
+                            "type": "text", "content": frag, "page": page_idx,
+                            "metadata": {"section": current_section},
+                        })
             else:
                 # Basic Fallback logic
                 blocks = page.get_text("blocks")
@@ -261,6 +414,12 @@ class DocumentParser:
                 # 'lattice' only finds ruled tables. Plenty of maintenance tables
                 # (torque specs, fault codes) are whitespace-aligned with no borders,
                 # which lattice misses entirely - hence the stream fallback.
+                #
+                # A caption like "Key to Figure 1.1" is printed on the page but is
+                # never part of camelot's grid - guessed once per page (not per
+                # table) since it's almost always one heading shared by whichever
+                # table follows it.
+                table_caption = _guess_table_caption(page_text)
                 seen_tables = 0
                 for flavor in ("lattice", "stream"):
                     try:
@@ -275,15 +434,23 @@ class DocumentParser:
                         if not ok:
                             print(f"      [TableValidator] Rejected {flavor} table on page {page_idx}: {why}")
                             continue
+                        title = _table_title(df, table_caption, current_section)
                         parsed_data.append({
                             "type": "table", "page": page_idx,
-                            "content": df.to_json(),
+                            # Readable "Header: value" lines, not df.to_json().
+                            # The pipeline summarises this, but keeps these rows
+                            # alongside the summary so the row-level pairing
+                            # ("3 = Clutch housing") survives into the embedded
+                            # text instead of being paraphrased away.
+                            "content": _df_to_text(df, title),
                             "kind": "table",
                             "render_markdown": _df_to_markdown(df),
                             "metadata": {
                                 "section": current_section,
                                 "table_index": seen_tables,
                                 "flavor": flavor,
+                                "caption": table_caption,
+                                "title": title,
                             },
                         })
                         seen_tables += 1

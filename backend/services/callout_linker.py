@@ -25,8 +25,17 @@ def _code_pattern(code: str):
     ('7' otherwise matches inside '1700 rpm' or a torque spec)."""
     esc = re.escape(code)
     if code.isdigit():
-        # (7)  7.  7)  7 -  item 7
-        return re.compile(rf"(?<![\w.-])[\(\[]?{esc}[\)\].:\-–]|\bitem\s+{esc}\b", re.IGNORECASE)
+        return re.compile(
+            # (7)  7.  7)  7 -
+            rf"(?<![\w.-])[\(\[]?{esc}[\)\].:\-–]"
+            # item 7 / Item: 7 / item-7. The separator was a bare \s+ before,
+            # which matched none of the manual's legend rows: they render as
+            # "Item: 7 | Component: ...", so every numeric callout in a figure
+            # key silently failed to resolve and the diagram kept only its
+            # meaningless bare numbers.
+            rf"|\bitems?\s*[:.\-]?\s*{esc}(?!\w)",
+            re.IGNORECASE,
+        )
     return re.compile(rf"(?<![\w-]){esc}(?![\w-])", re.IGNORECASE)
 
 

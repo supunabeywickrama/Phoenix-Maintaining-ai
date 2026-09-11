@@ -14,7 +14,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from unified_rag.db.database import SessionLocal
-from unified_rag.db.models import Machine, ManualChunk
+from unified_rag.db.models import Machine
+from unified_rag.db import qdrant_store
 
 router = APIRouter(prefix="/api/machines", tags=["Machine Registry"])
 logger = logging.getLogger(__name__)
@@ -62,11 +63,7 @@ class MachineOut(BaseModel):
 
 
 def _chunk_counts(db: Session) -> dict:
-    return dict(
-        db.query(ManualChunk.manual_id, func.count(ManualChunk.id))
-        .group_by(ManualChunk.manual_id)
-        .all()
-    )
+    return qdrant_store.count_all_manual_chunks()
 
 
 @router.get("", response_model=List[MachineOut])

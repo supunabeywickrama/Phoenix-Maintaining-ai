@@ -100,12 +100,17 @@ class ImageCaptioner:
             'or pointer (e.g. "Harness attachment point", "Drive shaft tube") - the exact wording '
             'shown, not numbered callouts (those go in "codes").\n'
             '  "caption": a dense 100-180 word description written for search retrieval. Cover: '
-            'what the component is, its function, how its parts connect, and what EACH numbered '
-            'callout or leader label points to if you can tell from the drawing. Use the page text '
+            'what the component is, its function, and how its parts connect. Use the page text '
             'above to get the machine, power source and terminology right. Use standard engineering '
             'terminology a technician would search for.\n\n'
             "Describe only what is actually visible. Do not invent part numbers, and do not guess "
-            "a different type of machine or power source than the page text states."
+            "a different type of machine or power source than the page text states.\n\n"
+            "NUMBERED CALLOUTS - READ CAREFULLY: a bare number on a leader line does NOT tell you "
+            "what the part is. The manual says what it is, in a separate key/legend table that you "
+            "cannot see. So NEVER write a sentence of the form 'N is the <part>' for a numbered "
+            "callout unless the page text above literally states it. Put the numbers in \"codes\" "
+            "and describe the drawing around them instead. Guessing here is worse than silence: it "
+            "produces confident, wrong part lists that contradict the manual's own legend."
         )
 
         raw = None

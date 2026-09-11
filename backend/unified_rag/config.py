@@ -34,6 +34,17 @@ class Settings(BaseSettings):
     cloudinary_cloud_name: Optional[str] = Field(None, alias="CLOUDINARY_CLOUD_NAME")
     cloudinary_api_key: Optional[str] = Field(None, alias="CLOUDINARY_API_KEY")
     cloudinary_api_secret: Optional[str] = Field(None, alias="CLOUDINARY_API_SECRET")
+
+    # Qdrant (vector search — replaces pgvector). Postgres is kept for
+    # relational data (manuals, machines, sessions, messages); only the two
+    # tables that carried an `embedding` column move here.
+    #
+    # Defaults to Qdrant's standard local/Docker port, same pattern as
+    # AI_BASE_URL defaulting to a real endpoint rather than erroring — running
+    # `docker run ... qdrant/qdrant` with no config Just Works. Point this at
+    # a Cloud cluster URL instead (and set QDRANT_API_KEY) to use Cloud.
+    qdrant_url: str = Field("http://localhost:6333", alias="QDRANT_URL")
+    qdrant_api_key: Optional[str] = Field(None, alias="QDRANT_API_KEY")
     
     @property
     def database_url(self) -> str:

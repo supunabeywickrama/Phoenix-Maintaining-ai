@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from unified_rag.ai_client import get_client, MODEL_CHAT
 from unified_rag.embeddings.embedder import embedder
-from unified_rag.db.models import InteractionMemory
+from unified_rag.db import qdrant_store as qs
 
 
 def summarize_and_archive(
@@ -22,8 +22,12 @@ def summarize_and_archive(
 ) -> str:
     """
     Summarize a resolved incident's chat history + operator fix, embed the
-    summary, and add an InteractionMemory row to the session (caller commits).
+    summary, and write it to Qdrant's interaction_memory collection.
     Returns the generated summary text.
+
+    `db` (a Postgres session) is accepted but unused — kept so callers don't
+    need to change; interaction memory moved to Qdrant with manual_chunks,
+    Postgres now only holds the relational session/message rows around this.
     """
     summary_prompt = (
         "You are a Technical Scribe. Below is a diagnostic chat history and the operator's actual fix.\n"
@@ -36,13 +40,12 @@ def summarize_and_archive(
     )
     summary = res.choices[0].message.content
 
-    mem = InteractionMemory(
+    qs.upsert_interaction_memory(
+        embedder.embed_text(summary),
         machine_id=machine_id,
         manual_id="Historical_Knowledge",
         summary=summary,
         operator_fix=operator_fix,
-        embedding=embedder.embed_text(summary),
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
-    db.add(mem)
     return summary

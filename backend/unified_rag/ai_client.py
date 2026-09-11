@@ -7,6 +7,7 @@ hardcoding a model string. This is what makes swapping providers (DashScope
 now, self-hosted vLLM/Ollama later) a single .env change instead of an
 N-file migration.
 """
+import re
 from functools import lru_cache
 from typing import Optional
 
@@ -66,7 +67,31 @@ def _ollama_native(model: str, prompt: str, image_b64: Optional[str], max_tokens
     r = requests.post(f"{base}/api/chat", json=payload, timeout=180)
     r.raise_for_status()
     msg = r.json().get("message", {})
-    return msg.get("content") or msg.get("thinking")
+    return _strip_reasoning(msg.get("content")) or _strip_reasoning(msg.get("thinking"))
+
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_UNCLOSED = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_reasoning(text: Optional[str]) -> Optional[str]:
+    """Remove a Qwen reasoning block from a response.
+
+    `think: False` suppresses this almost always, but not reliably: three
+    captions in a real ingested manual were stored with the model's raw
+    reasoning as their body ("<think> Got it, let's tackle this. First, the
+    user wants..."), which then got embedded and would have been shown to a
+    technician as the figure's description.
+
+    An UNCLOSED <think> means the model spent its whole budget reasoning and
+    never reached an answer — everything after the tag is reasoning, so the
+    result is nothing, and the caller's fallback path (a plain prose caption,
+    or skipping the chunk) is the correct outcome rather than storing this.
+    """
+    if not text:
+        return None
+    cleaned = _THINK_UNCLOSED.sub("", _THINK_BLOCK.sub("", text)).strip()
+    return cleaned or None
 
 
 def _openai_compat(model: str, prompt: str, image_b64: Optional[str], max_tokens: int,
@@ -83,7 +108,7 @@ def _openai_compat(model: str, prompt: str, image_b64: Optional[str], max_tokens
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     res = get_client().chat.completions.create(**kwargs)
-    return res.choices[0].message.content
+    return _strip_reasoning(res.choices[0].message.content)
 
 
 def chat_text(model: str, prompt: str, image_b64: Optional[str] = None, max_tokens: int = 800,

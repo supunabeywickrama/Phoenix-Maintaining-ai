@@ -21,6 +21,7 @@ from sqlalchemy import text
 from unified_rag.config import settings
 from unified_rag.db.database import engine, Base
 from unified_rag.db import models  # noqa: F401  — registers tables on Base
+from unified_rag.db import qdrant_store
 from services.cloudinary_service import LOCAL_DATA_DIR
 
 from unified_rag.api.endpoints import router as manuals_router
@@ -31,8 +32,35 @@ logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.I
 logger = logging.getLogger(__name__)
 
 
+def init_qdrant() -> None:
+    """Ensure the two vector collections exist.
+
+    Same resilience pattern as init_db() below: never crash the app over this.
+    Unlike init_db(), a missing/unreachable Qdrant is not necessarily fatal —
+    ordinary chat (sessions, machines) still works via Postgres; only
+    manual-grounded retrieval degrades. Every query.retrieve() call already
+    wraps its Qdrant calls in try/except and fails to an empty result set for
+    exactly this reason.
+    """
+    try:
+        qdrant_store.ensure_collections()
+        logger.info("✅ Qdrant collections verified at %s.", settings.qdrant_url)
+    except Exception as e:
+        logger.error(
+            "Could not reach Qdrant at %s: %s — vector search (manual Q&A) will "
+            "return no results until it's reachable. Sessions/machines still "
+            "work via Postgres.", settings.qdrant_url, e,
+        )
+
+
 def init_db() -> None:
-    """Ensure pgvector exists and the six tables are present."""
+    """Ensure the relational tables are present.
+
+    The two vector tables (manual_chunks, interaction_memory) are also created
+    here if missing — their SQLAlchemy models are kept registered on Base as a
+    legacy read path for scripts/migrate_to_qdrant.py — but the app no longer
+    writes to them; see unified_rag/db/models.py.
+    """
     try:
         with engine.connect() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
@@ -75,6 +103,7 @@ def init_db() -> None:
 
 
 init_db()
+init_qdrant()
 
 app = FastAPI(
     title="Phoenix Industries — Maintenance Copilot",

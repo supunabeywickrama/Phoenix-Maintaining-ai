@@ -100,6 +100,20 @@ class RAGGenerator:
                 except Exception as e:
                     print(f"Table relevance check skipped: {e}")
 
+            # STAGE 1c: LEGEND PAIRING
+            # A figure whose callouts are just "1", "2", "3..." on the drawing
+            # only answers anything once matched to the table that names them
+            # (e.g. "Key to Figure 1.1"). That table doesn't necessarily rank on
+            # its own for the user's wording, so it's paired in by hard evidence
+            # - shared item numbers - rather than left to vector search luck.
+            if retrieved_data.get("images"):
+                try:
+                    retrieved_data["tables"] = self.retriever.attach_legend_tables(
+                        manual_id, retrieved_data["images"], retrieved_data.get("tables", [])
+                    )
+                except Exception as e:
+                    print(f"Legend table pairing skipped: {e}")
+
             # STAGE 2: CONTEXT BUILDER
             text_context = ""
             pages = set()
@@ -243,6 +257,14 @@ class RAGGenerator:
                     "8. Never present a component crop as though it were the whole assembly.\n"
                     "9. Use ONLY the tags listed above. If no table is listed, do not write a "
                     "[TABLE_n] tag at all - state the values in your own words instead.\n"
+                    "10. NUMBERED CALLOUTS: if a figure's description lists 'Parts shown in this "
+                    "diagram: 1 = ..., 2 = ...' and a [TABLE_n] with a title like 'Key to Figure' "
+                    "is available for it, that table is the legend for those exact numbers. Show "
+                    "the figure, then the [TABLE_n] tag right after it, then walk through the "
+                    "callouts by number in your own words, e.g. '(1) is the cutter bar assembly, "
+                    "(2) the gearbox and eccentric drive, ...' - do not just say 'see the table "
+                    "below' and stop. If the question named a component (e.g. 'what is the "
+                    "clutch housing'), find its number in the list and say which callout it is.\n"
                 )
 
             if cross_context:
