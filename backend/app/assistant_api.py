@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from unified_rag.ai_client import get_client, MODEL_CHAT, MODEL_CHAT_LIGHT
+from unified_rag.ai_client import get_client, chat_text, MODEL_CHAT, MODEL_CHAT_LIGHT
 from unified_rag.config import settings
 from unified_rag.db.database import SessionLocal
 from unified_rag.db.models import (
@@ -54,17 +54,31 @@ class AskMode(str, Enum):
     WIZARD = "wizard"   # conversational step-by-step repair
 
 
+class ChatIntent(str, Enum):
+    """Why the technician opened this chat.
+
+    A fault on the floor and a training question need different answers from the
+    same manual: one wants a diagnosis and a safe repair path, the other wants an
+    explanation. Asking once at the start beats inferring it per message, which
+    got it wrong on phrasings like "why does the pump cavitate?".
+    """
+    TROUBLESHOOT = "troubleshoot"
+    LEARN = "learn"
+
+
 class AssistantQuery(BaseModel):
     query: str
     session_id: Optional[int] = None
     machine_id: Optional[str] = None
     manual_id: Optional[str] = None   # ask a manual directly, without a machine
     mode: AskMode = AskMode.ANSWER
+    intent: Optional[ChatIntent] = None   # set on the first message of a session
 
 
 class SessionOut(BaseModel):
     id: int
     machine_id: Optional[str]
+    intent: Optional[str] = None
     title: str
     timestamp: str
     resolved: bool = False
@@ -73,6 +87,7 @@ class SessionOut(BaseModel):
 class MessageOut(BaseModel):
     role: str
     content: str
+    attachments: List[Dict[str, Any]] = []
     type: str
     step_data: Optional[Dict[str, Any]] = None
     images: List[str] = []
@@ -97,15 +112,14 @@ def _now() -> str:
 
 def _generate_title(query: str) -> str:
     try:
-        res = get_client().chat.completions.create(
-            model=MODEL_CHAT_LIGHT,
-            messages=[{
-                "role": "user",
-                "content": f"Give a 3-5 word title for a maintenance chat that starts with: '{query}'. Reply with the title only.",
-            }],
-            max_tokens=24,
+        title = chat_text(
+            MODEL_CHAT_LIGHT,
+            f"Give a 3-5 word title for a maintenance chat that starts with: '{query}'. "
+            "Reply with the title only.",
+            max_tokens=200, temperature=0.2,
         )
-        return res.choices[0].message.content.strip().strip('"')[:80]
+        title = (title or "").strip().strip('"').splitlines()[0] if title else ""
+        return title[:80] or (query[:60] or "New enquiry")
     except Exception as e:
         logger.warning("Title generation failed: %s", e)
         return query[:60] or "New enquiry"
@@ -153,6 +167,7 @@ async def list_sessions(db: Session = Depends(get_db)):
         SessionOut(
             id=s.id,
             machine_id=s.machine_id,
+            intent=s.intent,
             title=s.title,
             timestamp=s.updated_at,
             resolved=bool(s.resolved_at),
@@ -186,6 +201,7 @@ async def session_history(session_id: int, db: Session = Depends(get_db)):
             type=m.type or "text",
             step_data=json.loads(m.step_data) if m.step_data else None,
             images=json.loads(m.images) if m.images else [],
+            attachments=json.loads(m.attachments) if m.attachments else [],
             timestamp=m.timestamp,
         )
         for m in messages
@@ -206,6 +222,7 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
     if session is None:
         session = AssistantSession(
             machine_id=req.machine_id,
+            intent=(req.intent.value if req.intent else ChatIntent.TROUBLESHOOT.value),
             title=_generate_title(req.query),
             created_at=_now(),
             updated_at=_now(),
@@ -215,6 +232,8 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
         db.refresh(session)
     elif req.machine_id:
         session.machine_id = req.machine_id
+    if req.intent:
+        session.intent = req.intent.value
 
     machine_id = req.machine_id or session.machine_id
 
@@ -237,6 +256,8 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
 
     manual_id = _resolve_manual(db, machine_id, req.manual_id)
     images: List[str] = []
+    attachments: List[Dict[str, Any]] = []
+    cross_manual: List[Dict[str, Any]] = []
 
     if manual_id:
         chunk_count = _has_content(db, manual_id)
@@ -245,7 +266,19 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
         else:
             logger.info("[Provenance] %d manual chunks found for %s.", chunk_count, manual_id)
 
-        mode = RAGMode.CONVERSATIONAL_WIZARD if req.mode == AskMode.WIZARD else RAGMode.SUMMARY
+        intent = req.intent.value if req.intent else (session.intent or ChatIntent.TROUBLESHOOT.value)
+        if req.mode == AskMode.WIZARD:
+            # A learning walkthrough is not a repair: the repair wizard opens with
+            # lockout/tagout, which is the wrong first move when nothing is broken.
+            mode = (
+                RAGMode.LEARNING_WALKTHROUGH
+                if intent == ChatIntent.LEARN.value
+                else RAGMode.CONVERSATIONAL_WIZARD
+            )
+        elif intent == ChatIntent.LEARN.value:
+            mode = RAGMode.LEARNING
+        else:
+            mode = RAGMode.SUMMARY
         query = req.query if chunk_count else f"{MISSING_MANUAL_FLAG} {req.query}"
         history_text = "\n".join(f"{m.role.upper()}: {m.content}" for m in history)
 
@@ -258,6 +291,15 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
             # markers the UI needs to interleave diagrams.
             answer = result.get("answer") or "No response generated."
             images = _absolute_image_urls(result.get("images", []))
+            cross_manual = result.get("cross_manual", []) or []
+            # Figure URLs are stored repo-relative when Cloudinary is off, so the
+            # same absolutising the image list gets has to reach inside attachments.
+            attachments = []
+            for asset in result.get("attachments", []) or []:
+                asset = dict(asset)
+                if asset.get("url"):
+                    asset["url"] = _absolute_image_urls([asset["url"]])[0]
+                attachments.append(asset)
             source = f"Manual: {manual_id}" + ("" if chunk_count else " (no content on file)")
         except Exception as e:
             logger.error("RAG failed for manual %s: %s", manual_id, e)
@@ -272,9 +314,14 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
                 "role": "system",
                 "content": (
                     "You are a maintenance assistant for Phoenix Industries. No machine is "
-                    "selected, so you have no manual to draw on. Answer briefly from general "
-                    "engineering knowledge and tell the user to select a machine for guidance "
-                    "specific to their equipment."
+                    "selected, so you have no manual to draw on. "
+                    + (
+                        "The technician wants to understand how something works: explain it "
+                        "clearly from general engineering knowledge. "
+                        if (req.intent or session.intent) == ChatIntent.LEARN.value
+                        else "Answer briefly from general engineering knowledge. "
+                    )
+                    + "Tell the user to select a machine for guidance specific to their equipment."
                 ),
             }] + chat + [{"role": "user", "content": req.query}],
             max_tokens=600,
@@ -286,6 +333,7 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
         session_id=session.id, role="agent", content=answer,
         type="wizard_step" if req.mode == AskMode.WIZARD else "text",
         images=json.dumps(images) if images else None,
+        attachments=json.dumps(attachments) if attachments else None,
         timestamp=_now(),
     ))
     session.updated_at = _now()
@@ -298,7 +346,14 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
         "machine_id": machine_id,
         "manual_id": manual_id,
         "images": images,
+        # Everything shown with this reply, in presentation order: full view first,
+        # then its components, then the tables backing the numbers.
+        "attachments": attachments,
+        # Where else this topic is documented. Attributed, never merged into the
+        # answer as though it described this machine.
+        "cross_manual": cross_manual,
         "mode": req.mode.value,
+        "intent": session.intent,
         "context_source": source,
         "timestamp": _now(),
     }

@@ -2,11 +2,31 @@ import { createSlice, createAsyncThunk, PayloadAction } from "@reduxjs/toolkit";
 import { apiFetch } from "../api";
 
 export type AskMode = "answer" | "wizard";
+/** Why this chat was opened. Chosen once, when the conversation starts. */
+export type ChatIntent = "troubleshoot" | "learn";
+
+/**
+ * Something shown alongside an answer. Not just pictures: a manual's knowledge
+ * also lives in schematics, charts, flow diagrams and spec tables, and a table
+ * is far more use rendered as a table than paraphrased into a sentence.
+ */
+export interface Attachment {
+  /** Matches the inline marker in the answer text, e.g. "IMAGE_0" / "TABLE_1". */
+  tag: string;
+  type: "image" | "table";
+  kind: string;
+  role?: "full" | "part" | null;
+  title: string;
+  page: number | null;
+  url?: string;
+  markdown?: string;
+}
 
 export interface ChatMessage {
   role: "user" | "agent";
   content: string;
   images: string[];
+  attachments?: Attachment[];
   timestamp: string;
   type?: string;
   /** Set locally when a request fails, so the UI can style it as an error. */
@@ -16,6 +36,7 @@ export interface ChatMessage {
 export interface SessionSummary {
   id: number;
   machine_id: string | null;
+  intent?: ChatIntent | null;
   title: string;
   timestamp: string;
   resolved: boolean;
@@ -43,6 +64,8 @@ interface AssistantState {
   contextSource: string | null;
   error: string | null;
   report: MaintenanceReport | null;
+  /** null until the user picks a purpose for the current chat. */
+  intent: ChatIntent | null;
 }
 
 const initialState: AssistantState = {
@@ -55,6 +78,7 @@ const initialState: AssistantState = {
   contextSource: null,
   error: null,
   report: null,
+  intent: null,
 };
 
 interface AskResponse {
@@ -64,7 +88,9 @@ interface AskResponse {
   machine_id: string | null;
   manual_id: string | null;
   images: string[];
+  attachments: Attachment[];
   mode: AskMode;
+  intent: ChatIntent | null;
   context_source: string;
   timestamp: string;
 }
@@ -74,7 +100,7 @@ export const askAssistant = createAsyncThunk<
   { query: string; mode?: AskMode },
   { state: { assistant: AssistantState } }
 >("assistant/ask", async ({ query, mode = "answer" }, { getState }) => {
-  const { activeSessionId, selectedMachineId } = getState().assistant;
+  const { activeSessionId, selectedMachineId, intent } = getState().assistant;
   return apiFetch<AskResponse>("/api/assistant", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -83,6 +109,8 @@ export const askAssistant = createAsyncThunk<
       mode,
       session_id: activeSessionId ?? undefined,
       machine_id: selectedMachineId ?? undefined,
+      // Only sent on the first turn; afterwards the session carries it server-side.
+      intent: activeSessionId ? undefined : intent ?? undefined,
     }),
   });
 });
@@ -136,12 +164,18 @@ const assistantSlice = createSlice({
     setSelectedMachine(state, action: PayloadAction<string | null>) {
       state.selectedMachineId = action.payload;
     },
+    setIntent(state, action: PayloadAction<ChatIntent | null>) {
+      state.intent = action.payload;
+    },
     startNewSession(state) {
       state.activeSessionId = null;
       state.messages = [];
       state.contextSource = null;
       state.error = null;
       state.report = null;
+      // Cleared so the next chat asks its purpose again rather than silently
+      // inheriting the previous conversation's mode.
+      state.intent = null;
     },
     clearError(state) {
       state.error = null;
@@ -167,10 +201,12 @@ const assistantSlice = createSlice({
         state.isAsking = false;
         state.activeSessionId = action.payload.session_id;
         state.contextSource = action.payload.context_source;
+        if (action.payload.intent) state.intent = action.payload.intent;
         state.messages.push({
           role: "agent",
           content: action.payload.content,
           images: action.payload.images || [],
+          attachments: action.payload.attachments || [],
           timestamp: action.payload.timestamp,
           type: action.payload.mode === "wizard" ? "wizard_step" : "text",
         });
@@ -197,6 +233,9 @@ const assistantSlice = createSlice({
         }));
         const session = state.sessions.find((s) => s.id === action.payload.sessionId);
         state.selectedMachineId = session?.machine_id ?? state.selectedMachineId;
+        // Reopening a thread resumes the purpose it was started with, so a
+        // learning conversation doesn't turn into a fault report mid-way.
+        state.intent = session?.intent ?? null;
         state.report = null;
       })
       .addCase(deleteSession.fulfilled, (state, action) => {
@@ -233,6 +272,6 @@ const assistantSlice = createSlice({
   },
 });
 
-export const { setSelectedMachine, startNewSession, clearError, clearReport } =
+export const { setSelectedMachine, setIntent, startNewSession, clearError, clearReport } =
   assistantSlice.actions;
 export default assistantSlice.reducer;

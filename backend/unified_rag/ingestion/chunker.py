@@ -40,6 +40,8 @@ class ContextualChunker:
                     "type": "table",
                     "content": item["content"],
                     "page": item["page"],
+                    "kind": item.get("kind", "table"),
+                    "render_markdown": item.get("render_markdown"),
                     "metadata": item.get("metadata", {})
                 })
                 
@@ -51,6 +53,11 @@ class ContextualChunker:
                     "path": item["path"],
                     "content": item.get("content", ""), # Vision Caption will be filled later
                     "page": item["page"],
+                    "kind": item.get("kind"),
+                    "figure_role": item.get("figure_role", "full"),
+                    "parent_path": item.get("parent_path"),
+                    "width": item.get("width"),
+                    "height": item.get("height"),
                     "metadata": item.get("metadata", {})
                 })
                 

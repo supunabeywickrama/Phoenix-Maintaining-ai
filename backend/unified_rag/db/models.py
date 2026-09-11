@@ -27,6 +27,27 @@ class ManualChunk(Base):
     page = Column(Integer, nullable=True)
     path = Column(String, nullable=True)    # Cloudinary URL of an extracted figure
 
+    # Figure structure. A composite drawing is stored as the whole figure plus one
+    # chunk per component SAM isolated from it, so an answer can show the full
+    # diagram for orientation before zooming into the part being discussed.
+    # NULL means "ingested before this existed" and is treated as 'full'.
+    figure_role = Column(String, nullable=True)    # 'full' | 'part'
+    parent_path = Column(String, nullable=True)    # for a part: path of its full figure
+    width = Column(Integer, nullable=True)         # pixels, used to drop unusably small crops
+    height = Column(Integer, nullable=True)
+
+    # What this asset actually IS, beyond text/image/table: 'diagram', 'schematic',
+    # 'chart', 'flowchart', 'photo', 'table', 'exploded_view'. A technician reading
+    # "Figure 3" learns nothing; "Wiring schematic (page 12)" tells them whether it
+    # is worth opening. Also drives presentation order in an answer.
+    kind = Column(String, nullable=True)
+
+    # Markdown for assets that should be rendered as structure rather than shown as
+    # a picture - currently tables. camelot already returns a DataFrame at ingestion;
+    # previously only an LLM prose summary was kept and the grid was discarded, so a
+    # table could never be displayed as a table.
+    render_markdown = Column(Text, nullable=True)
+
 
 class Manual(Base):
     """Metadata for a source PDF stored in Cloudinary."""
@@ -78,6 +99,10 @@ class AssistantSession(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     machine_id = Column(String, index=True, nullable=True)
+    # 'troubleshoot' | 'learn' — chosen when the chat starts. A fault report and a
+    # "how does this work" question want different answers, so the whole thread is
+    # steered by it rather than re-guessing the intent on every turn.
+    intent = Column(String, nullable=True)
     title = Column(String, nullable=False)
     created_at = Column(String, nullable=False)
     updated_at = Column(String, nullable=False)
@@ -96,4 +121,8 @@ class AssistantMessage(Base):
     type = Column(String, default='text')   # 'text' | 'wizard_step'
     step_data = Column(Text, nullable=True)  # JSON
     images = Column(Text, nullable=True)     # JSON list of URLs
+    # JSON list of typed assets shown with this reply: figures, schematics, charts
+    # and rendered tables. `images` is kept alongside it for older messages and for
+    # the report view, which only deals in pictures.
+    attachments = Column(Text, nullable=True)
     timestamp = Column(String, nullable=False)

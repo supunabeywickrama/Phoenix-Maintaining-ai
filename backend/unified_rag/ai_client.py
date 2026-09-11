@@ -8,6 +8,8 @@ now, self-hosted vLLM/Ollama later) a single .env change instead of an
 N-file migration.
 """
 from functools import lru_cache
+from typing import Optional
+
 from openai import OpenAI
 from unified_rag.config import settings
 
@@ -28,55 +30,76 @@ def is_local_ollama() -> bool:
     return "11434" in settings.ai_base_url
 
 
-def chat_json(model: str, text_prompt: str, image_b64: str | None = None,
-              max_tokens: int = 2000, temperature: float = 0.0) -> str | None:
-    """JSON-mode chat completion, optionally with one image.
+def _ollama_native(model: str, prompt: str, image_b64: Optional[str], max_tokens: int,
+                   temperature: float, json_mode: bool, system: Optional[str]) -> Optional[str]:
+    """Call Ollama's native /api/chat.
 
-    Routes through Ollama's *native* /api/chat when AI_BASE_URL is a local
-    Ollama server, instead of the shared OpenAI-compatible client. Reason:
-    as of Ollama 0.33.3, its OpenAI-compatible endpoint does not honor
-    `think: false` for reasoning-capable models (confirmed empirically —
-    qwen3-vl burns its entire token budget, sometimes 4000+, on hidden
-    chain-of-thought via that endpoint and never reaches `content`, even
-    with a larger num_ctx). The native API correctly suppresses thinking
-    and completes in under 100 tokens — it just misfiles the final answer
-    under `message.thinking` instead of `message.content` in this build,
-    which this works around by checking both.
-
-    Hosted providers (DashScope, etc.) are unaffected and keep using the
-    normal OpenAI-compatible path below, unchanged.
-
-    Returns raw text for the caller to parse (e.g. via services.llm_json),
-    or None.
+    Why this exists: as of Ollama 0.33.3 the OpenAI-compatible endpoint does
+    NOT honor `think: false` for reasoning models. Verified empirically —
+    qwen3-vl burns its entire budget (4000+ tokens, even with num_ctx raised)
+    on hidden chain-of-thought and never emits `content`. The native endpoint
+    suppresses thinking correctly and answers in under 100 tokens; it just
+    misfiles the answer under `message.thinking` in this build, so we read
+    both fields.
     """
-    if not is_local_ollama():
-        content: list = [{"type": "text", "text": text_prompt}]
-        if image_b64:
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
-        res = get_client().chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=max_tokens,
-            temperature=temperature,
-            response_format={"type": "json_object"},
-        )
-        return res.choices[0].message.content
-
     import requests
 
     base = settings.ai_base_url.rsplit("/v1", 1)[0]
-    message: dict = {"role": "user", "content": text_prompt}
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    user_msg: dict = {"role": "user", "content": prompt}
     if image_b64:
-        message["images"] = [image_b64]
+        user_msg["images"] = [image_b64]
+    messages.append(user_msg)
+
     payload = {
         "model": model,
-        "messages": [message],
+        "messages": messages,
         "think": False,
-        "format": "json",
         "options": {"temperature": temperature, "num_predict": max_tokens},
         "stream": False,
     }
-    r = requests.post(f"{base}/api/chat", json=payload, timeout=120)
+    if json_mode:
+        payload["format"] = "json"
+
+    r = requests.post(f"{base}/api/chat", json=payload, timeout=180)
     r.raise_for_status()
     msg = r.json().get("message", {})
     return msg.get("content") or msg.get("thinking")
+
+
+def _openai_compat(model: str, prompt: str, image_b64: Optional[str], max_tokens: int,
+                   temperature: float, json_mode: bool, system: Optional[str]) -> Optional[str]:
+    content: list = [{"type": "text", "text": prompt}]
+    if image_b64:
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": content})
+
+    kwargs = dict(model=model, messages=messages, max_tokens=max_tokens, temperature=temperature)
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    res = get_client().chat.completions.create(**kwargs)
+    return res.choices[0].message.content
+
+
+def chat_text(model: str, prompt: str, image_b64: Optional[str] = None, max_tokens: int = 800,
+              temperature: float = 0.2, system: Optional[str] = None) -> Optional[str]:
+    """Plain-text completion, optionally with one image.
+
+    Routes to Ollama's native API when running locally (see _ollama_native for
+    why); hosted providers keep the normal OpenAI-compatible path unchanged.
+    """
+    fn = _ollama_native if is_local_ollama() else _openai_compat
+    return fn(model, prompt, image_b64, max_tokens, temperature, False, system)
+
+
+def chat_json(model: str, text_prompt: str, image_b64: Optional[str] = None, max_tokens: int = 2000,
+              temperature: float = 0.0, system: Optional[str] = None) -> Optional[str]:
+    """JSON-mode completion, optionally with one image. Returns raw text for the
+    caller to parse (e.g. via services.llm_json.loads_tolerant), or None."""
+    fn = _ollama_native if is_local_ollama() else _openai_compat
+    return fn(model, text_prompt, image_b64, max_tokens, temperature, True, system)

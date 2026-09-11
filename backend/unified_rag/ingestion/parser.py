@@ -24,6 +24,30 @@ try:
 except ImportError:
     camelot = None
 
+def _df_to_markdown(df) -> str:
+    """Render a camelot DataFrame as a markdown table.
+
+    Kept alongside the LLM summary rather than instead of it: the summary is what
+    gets embedded and searched, this is what the technician actually reads.
+    """
+    try:
+        rows = df.fillna("").astype(str).values.tolist()
+        if not rows:
+            return ""
+        header = [c.strip().replace("\n", " ") or f"Col {i+1}" for i, c in enumerate(rows[0])]
+        body = rows[1:]
+        out = ["| " + " | ".join(header) + " |",
+               "| " + " | ".join("---" for _ in header) + " |"]
+        for r in body:
+            cells = [str(c).strip().replace("\n", " ").replace("|", "\\|") for c in r]
+            cells += [""] * (len(header) - len(cells))
+            out.append("| " + " | ".join(cells[:len(header)]) + " |")
+        return "\n".join(out)
+    except Exception as e:
+        print(f"      [Parser] Could not render table as markdown: {e}")
+        return ""
+
+
 class DocumentParser:
     def __init__(self, yolo_weights="models/yolov8_doclaynet.pt"):
         self.cloudinary = CloudinaryService()
@@ -65,6 +89,7 @@ class DocumentParser:
         - Uses FigureSplitter to decompose composite drawings.
         """
         from services.figure_splitter import FigureSplitter
+        from services.figure_validator import is_valid_figure
         splitter = FigureSplitter()
         
         print(f"📄 [Parser] Opening PDF: {file_path}")
@@ -114,8 +139,16 @@ class DocumentParser:
                         # Extract the raw region
                         raw_crop = img_bgr[int(y1):int(y2), int(x1):int(x2)]
                         
+                        # Validate BEFORE spending vision calls: the layout model's
+                        # 'Picture' class also catches logos, warning icons, rules and
+                        # dense text blocks, which are useless as retrievable figures.
+                        keep, why = is_valid_figure(raw_crop)
+                        if not keep:
+                            print(f"      🚫 [Validator] Rejected region on page {page_idx}: {why}")
+                            continue
+
                         parent_ctx = f"Figure on Page {page_idx} under section '{current_section}'"
-                        print(f"      [Figure] Decomposing composite drawing...")
+                        print(f"      [Figure] Accepted ({why}). Decomposing composite drawing...")
                         
                         try:
                             sub_figures = splitter.split_image_sam(raw_crop, parent_context=parent_ctx)
@@ -123,42 +156,58 @@ class DocumentParser:
                             print(f"      ⚠️ [Parser] Figure decomposition crashed: {e}. Using fallback.")
                             sub_figures = []
                         
-                        if not sub_figures:
-                            # Fallback to simple crop if splitter finds nothing or crashes.
-                            # Upload directly from memory (cv2.imencode) — no local file at all.
-                            _, buf = cv2.imencode(".png", raw_crop)
+                        # The whole figure is always stored, even when it splits
+                        # cleanly: an explanation should show the full drawing for
+                        # orientation before zooming into one component.
+                        fh, fw = raw_crop.shape[:2]
+                        _, buf = cv2.imencode(".png", raw_crop)
+                        full_url = self.cloudinary.upload_image(
+                            io.BytesIO(buf.tobytes()), f"{manual_id}_p{page_idx}_fig{img_index}"
+                        )
+
+                        if full_url:
+                            parsed_data.append({
+                                "type": "image", "path": full_url, "page": page_idx,
+                                "figure_role": "full", "parent_path": None,
+                                "width": fw, "height": fh,
+                                "metadata": {
+                                    "section": current_section,
+                                    "label": "Full Diagram",
+                                    "figure_role": "full",
+                                },
+                            })
+                        else:
+                            print(f"      [Parser] Upload unavailable - skipping figure (page {page_idx}).")
+
+                        for i, sub in enumerate(sub_figures):
+                            sub_keep, sub_why = is_valid_figure(sub["crop"], use_vision=False)
+                            if not sub_keep:
+                                print(f"         [Validator] Dropped component: {sub_why}")
+                                continue
+
+                            sh, sw = sub["crop"].shape[:2]
+                            _, buf = cv2.imencode(".png", sub["crop"])
                             cloud_url = self.cloudinary.upload_image(
-                                io.BytesIO(buf.tobytes()), f"{manual_id}_p{page_idx}_fig{img_index}"
+                                io.BytesIO(buf.tobytes()), f"{manual_id}_p{page_idx}_sub{img_index}_{i}"
                             )
 
                             if cloud_url:
                                 parsed_data.append({
                                     "type": "image", "path": cloud_url, "page": page_idx,
-                                    "metadata": {"section": current_section, "label": "Main Diagram"}
+                                    "figure_role": "part", "parent_path": full_url,
+                                    "width": sw, "height": sh,
+                                    "metadata": {
+                                        "section": current_section,
+                                        "label": sub["label"],
+                                        "parent_context": parent_ctx,
+                                        "figure_role": "part",
+                                    },
                                 })
+                                print(f"         Isolated component: {sub['label']} ({sw}x{sh})")
                             else:
-                                print(f"      ⚠️ [Parser] Cloudinary upload unavailable — skipping image chunk (page {page_idx}, fig {img_index}).")
-                            img_index += 1
-                        else:
-                            for i, sub in enumerate(sub_figures):
-                                _, buf = cv2.imencode(".png", sub["crop"])
-                                cloud_url = self.cloudinary.upload_image(
-                                    io.BytesIO(buf.tobytes()), f"{manual_id}_p{page_idx}_sub{img_index}_{i}"
-                                )
+                                print(f"      [Parser] Upload unavailable - skipping sub-figure.")
 
-                                if cloud_url:
-                                    parsed_data.append({
-                                        "type": "image", "path": cloud_url, "page": page_idx,
-                                        "metadata": {
-                                            "section": current_section,
-                                            "label": sub["label"],
-                                            "parent_context": parent_ctx
-                                        }
-                                    })
-                                    print(f"         ∟ Isolated component: {sub['label']}")
-                                else:
-                                    print(f"      ⚠️ [Parser] Cloudinary upload unavailable — skipping sub-figure chunk ({sub['label']}).")
-                            img_index += 1
+                        img_index += 1
                         
                     # TEXT 
                     elif "text" in class_name or "list" in class_name:
@@ -178,14 +227,35 @@ class DocumentParser:
 
             # Step 2: Tables (with context)
             if camelot:
-                try:
-                    tables = camelot.read_pdf(file_path, pages=str(page_idx), flavor='lattice')
+                # 'lattice' only finds ruled tables. Plenty of maintenance tables
+                # (torque specs, fault codes) are whitespace-aligned with no borders,
+                # which lattice misses entirely - hence the stream fallback.
+                seen_tables = 0
+                for flavor in ("lattice", "stream"):
+                    try:
+                        tables = camelot.read_pdf(file_path, pages=str(page_idx), flavor=flavor)
+                    except Exception:
+                        continue
+                    if len(tables) == 0:
+                        continue
                     for i, table in enumerate(tables):
+                        df = table.df
+                        if df.empty or df.shape[0] < 2 or df.shape[1] < 2:
+                            continue
                         parsed_data.append({
-                            "type": "table", "page": page_idx, "content": table.df.to_json(),
-                            "metadata": {"section": current_section, "table_index": i}
+                            "type": "table", "page": page_idx,
+                            "content": df.to_json(),
+                            "kind": "table",
+                            "render_markdown": _df_to_markdown(df),
+                            "metadata": {
+                                "section": current_section,
+                                "table_index": seen_tables,
+                                "flavor": flavor,
+                            },
                         })
-                except Exception: pass
+                        seen_tables += 1
+                    if seen_tables:
+                        break  # lattice results are cleaner; don't duplicate with stream
             
         return parsed_data
             

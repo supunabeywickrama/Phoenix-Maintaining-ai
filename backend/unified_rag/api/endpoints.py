@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from unified_rag.ingestion.pipeline import process_manual_async
 from unified_rag.db.database import SessionLocal
-from unified_rag.db.models import Manual, ManualChunk
+from unified_rag.db.models import Manual, ManualChunk, Machine
 
 router = APIRouter()
 
@@ -50,6 +50,7 @@ async def ingest_manual(
     background_tasks: BackgroundTasks,
     manual_id: str = Form(...),
     file: UploadFile = File(...),
+    replace: bool = Form(True),
 ):
     print(f"\n🚀 [API] Received ingestion request for Manual ID: {manual_id}")
     print(f"📄 [API] File: {file.filename}")
@@ -93,6 +94,22 @@ async def ingest_manual(
     except Exception as e:
         # Losing the source-PDF copy must not stop us vectorising the content.
         print(f"⚠️ [API] Source PDF cloud sync failed: {e}")
+
+    # Re-ingesting the same manual_id used to append a second full set of chunks,
+    # leaving the old ones to compete in retrieval. Updating a manual means
+    # replacing its knowledge, so clear it first.
+    if replace:
+        db = SessionLocal()
+        try:
+            removed = db.query(ManualChunk).filter(ManualChunk.manual_id == manual_id).delete()
+            db.commit()
+            if removed:
+                print(f"♻️ [API] Replacing {manual_id}: cleared {removed} existing chunks.")
+        except Exception as e:
+            db.rollback()
+            print(f"⚠️ [API] Could not clear existing chunks for {manual_id}: {e}")
+        finally:
+            db.close()
 
     # Parsing needs a real filesystem path (Camelot has no in-memory API), so use
     # a momentary OS-tempdir file that the background task deletes when finished.
@@ -195,3 +212,92 @@ async def list_manuals(db: Session = Depends(get_db)):
             manuals[manual_id] = ManualSummary(manual_id=manual_id, chunks=count)
 
     return sorted(manuals.values(), key=lambda m: m.manual_id.lower())
+
+
+class RenameRequest(BaseModel):
+    new_manual_id: str
+
+
+def _delete_local_figures(manual_id: str) -> int:
+    """Remove figures written by CloudinaryService's local fallback. Cloudinary
+    assets are left alone — they're shared storage and may be referenced elsewhere."""
+    from services.cloudinary_service import LOCAL_DATA_DIR
+
+    removed = 0
+    manual_dir = LOCAL_DATA_DIR / "phoenix" / "manuals"
+    if not manual_dir.exists():
+        return 0
+    for f in manual_dir.glob(f"{manual_id}_*"):
+        try:
+            f.unlink()
+            removed += 1
+        except OSError as e:
+            print(f"⚠️ [API] Could not delete {f}: {e}")
+    return removed
+
+
+@router.delete("/api/manuals/{manual_id}")
+async def delete_manual(manual_id: str, db: Session = Depends(get_db)):
+    """Remove a manual and everything derived from it.
+
+    Machines pointing at it are left in place but flagged in the response — the
+    caller decides whether to relink or delete them, since a machine outliving
+    its manual is a real situation on the floor.
+    """
+    chunks = db.query(ManualChunk).filter(ManualChunk.manual_id == manual_id).delete()
+    record = db.query(Manual).filter(Manual.manual_id == manual_id).first()
+    if record:
+        db.delete(record)
+
+    if not chunks and not record:
+        raise HTTPException(status_code=404, detail=f"Manual '{manual_id}' not found.")
+
+    orphaned = [m.machine_id for m in db.query(Machine).filter(Machine.manual_id == manual_id).all()]
+    db.commit()
+
+    files = _delete_local_figures(manual_id)
+    _ingestion_jobs.pop(manual_id, None)
+    print(f"🗑️ [API] Deleted manual {manual_id}: {chunks} chunks, {files} figures.")
+
+    return {
+        "status": "deleted",
+        "manual_id": manual_id,
+        "chunks_removed": chunks,
+        "figures_removed": files,
+        "orphaned_machines": orphaned,
+    }
+
+
+@router.patch("/api/manuals/{manual_id}")
+async def rename_manual(manual_id: str, req: RenameRequest, db: Session = Depends(get_db)):
+    """Rename a manual_id, cascading to its chunks and any machines bound to it."""
+    new_id = req.new_manual_id.strip()
+    if not new_id:
+        raise HTTPException(status_code=400, detail="new_manual_id is required.")
+    if new_id == manual_id:
+        return {"status": "unchanged", "manual_id": manual_id}
+
+    if db.query(Manual).filter(Manual.manual_id == new_id).first() or        db.query(ManualChunk).filter(ManualChunk.manual_id == new_id).first():
+        raise HTTPException(status_code=409, detail=f"Manual '{new_id}' already exists.")
+
+    chunks = db.query(ManualChunk).filter(ManualChunk.manual_id == manual_id).update(
+        {ManualChunk.manual_id: new_id}
+    )
+    machines = db.query(Machine).filter(Machine.manual_id == manual_id).update(
+        {Machine.manual_id: new_id}
+    )
+    record = db.query(Manual).filter(Manual.manual_id == manual_id).first()
+    if record:
+        record.manual_id = new_id
+    elif not chunks:
+        raise HTTPException(status_code=404, detail=f"Manual '{manual_id}' not found.")
+
+    db.commit()
+    print(f"✏️ [API] Renamed {manual_id} -> {new_id} ({chunks} chunks, {machines} machines).")
+    return {
+        "status": "renamed",
+        "manual_id": new_id,
+        "previous_manual_id": manual_id,
+        "chunks_updated": chunks,
+        "machines_updated": machines,
+    }

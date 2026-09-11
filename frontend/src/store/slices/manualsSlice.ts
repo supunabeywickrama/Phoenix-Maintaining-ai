@@ -86,6 +86,38 @@ export const uploadManual = createAsyncThunk(
   }
 );
 
+export const deleteManual = createAsyncThunk(
+  "manuals/delete",
+  async (manualId: string, { dispatch }) => {
+    const res = await apiFetch<{
+      manual_id: string;
+      chunks_removed: number;
+      orphaned_machines: string[];
+    }>(`/api/manuals/${encodeURIComponent(manualId)}`, { method: "DELETE" });
+    dispatch(fetchManuals());
+    return res;
+  }
+);
+
+export const renameManual = createAsyncThunk(
+  "manuals/rename",
+  async (
+    { manualId, newManualId }: { manualId: string; newManualId: string },
+    { dispatch }
+  ) => {
+    const res = await apiFetch<{ manual_id: string; machines_updated: number }>(
+      `/api/manuals/${encodeURIComponent(manualId)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_manual_id: newManualId }),
+      }
+    );
+    dispatch(fetchManuals());
+    return res;
+  }
+);
+
 const manualsSlice = createSlice({
   name: "manuals",
   initialState,
@@ -113,6 +145,24 @@ const manualsSlice = createSlice({
         state.isUploading = false;
         state.error = action.error.message || "Upload failed";
         state.status = null;
+      })
+      .addCase(deleteManual.fulfilled, (state, action) => {
+        const { manual_id, chunks_removed, orphaned_machines } = action.payload;
+        const orphanNote = orphaned_machines.length
+          ? ` ${orphaned_machines.length} machine(s) still point at it: ${orphaned_machines.join(", ")}.`
+          : "";
+        state.status = `Deleted "${manual_id}" — ${chunks_removed} sections removed.${orphanNote}`;
+        state.error = null;
+      })
+      .addCase(deleteManual.rejected, (state, action) => {
+        state.error = action.error.message || "Delete failed";
+      })
+      .addCase(renameManual.fulfilled, (state, action) => {
+        state.status = `Renamed to "${action.payload.manual_id}" — ${action.payload.machines_updated} machine link(s) updated.`;
+        state.error = null;
+      })
+      .addCase(renameManual.rejected, (state, action) => {
+        state.error = action.error.message || "Rename failed";
       });
   },
 });

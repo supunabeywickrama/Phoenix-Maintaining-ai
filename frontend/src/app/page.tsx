@@ -7,24 +7,41 @@ import {
   askAssistant,
   fetchSessions,
   resolveSession,
+  setIntent,
   AskMode,
+  ChatIntent,
 } from "../store/slices/assistantSlice";
+import ChatIntentModal from "../components/ChatIntentModal";
 import MachineSelector from "../components/MachineSelector";
 import SessionSidebar from "../components/SessionSidebar";
 import AnswerBubble from "../components/AnswerBubble";
 import StepCard from "../components/StepCard";
-import { Send, Loader2, Flame, ClipboardCheck, FileDown } from "lucide-react";
+import { Send, Loader2, Flame, ClipboardCheck, FileDown, GraduationCap } from "lucide-react";
 
-const EXAMPLES = [
-  "The machine is vibrating more than usual — what should I check?",
-  "It keeps overheating during a long run. What causes that?",
-  "Walk me through replacing the drive belt.",
-];
+const EXAMPLES: Record<ChatIntent, string[]> = {
+  troubleshoot: [
+    "The machine is vibrating more than usual — what should I check?",
+    "It keeps overheating during a long run. What causes that?",
+    "Walk me through replacing the drive belt.",
+  ],
+  learn: [
+    "How does the hydraulic circuit on this machine work?",
+    "What does the pressure relief valve actually do?",
+    "Explain the lubrication system and what maintains it.",
+  ],
+};
 
 export default function AskPage() {
   const dispatch = useDispatch<AppDispatch>();
-  const { messages, isAsking, activeSessionId, selectedMachineId, contextSource, isResolving } =
-    useSelector((s: RootState) => s.assistant);
+  const {
+    messages,
+    isAsking,
+    activeSessionId,
+    selectedMachineId,
+    contextSource,
+    isResolving,
+    intent,
+  } = useSelector((s: RootState) => s.assistant);
 
   const [input, setInput] = useState("");
   const [fixText, setFixText] = useState("");
@@ -72,6 +89,17 @@ export default function AskPage() {
             <MachineSelector />
           </div>
           <div className="flex items-center gap-2">
+            {intent && (
+              <span
+                className={`rounded-full border px-3 py-1 text-[10px] font-bold uppercase tracking-wider ${
+                  intent === "learn"
+                    ? "border-sky-500/30 bg-sky-500/10 text-sky-400"
+                    : "border-amber-500/30 bg-amber-500/10 text-amber-400"
+                }`}
+              >
+                {intent === "learn" ? "Learning" : "Troubleshooting"}
+              </span>
+            )}
             {contextSource && (
               <span className="truncate rounded-full border border-slate-700 bg-slate-800/60 px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
                 {contextSource}
@@ -125,18 +153,29 @@ export default function AskPage() {
 
         <div className="flex-1 space-y-4 overflow-y-auto p-4 md:p-6">
           {messages.length === 0 && (
+            !intent ? (
+              <ChatIntentModal onSelect={(i) => dispatch(setIntent(i))} />
+            ) : (
             <div className="flex h-full flex-col items-center justify-center text-center">
               <div className="mb-4 rounded-2xl bg-orange-500/10 p-4">
-                <Flame size={32} className="text-orange-500" />
+                {intent === "learn" ? (
+                  <GraduationCap size={32} className="text-sky-400" />
+                ) : (
+                  <Flame size={32} className="text-orange-500" />
+                )}
               </div>
-              <h2 className="text-xl font-black text-white">Ask about a machine problem</h2>
+              <h2 className="text-xl font-black text-white">
+                {intent === "learn" ? "Learn how this machine works" : "Ask about a machine problem"}
+              </h2>
               <p className="mt-1 max-w-md text-sm text-slate-400">
                 {selectedMachineId
-                  ? "Answers are grounded in that machine's manual, with the relevant diagrams."
+                  ? intent === "learn"
+                    ? "Explanations are drawn from that machine's manual, with the diagrams that show it."
+                    : "Answers are grounded in that machine's manual, with the relevant diagrams."
                   : "Select a machine above to get answers from its manual."}
               </p>
               <div className="mt-6 flex w-full max-w-lg flex-col gap-2">
-                {EXAMPLES.map((ex) => (
+                {EXAMPLES[intent].map((ex) => (
                   <button
                     key={ex}
                     onClick={() => send(ex)}
@@ -147,6 +186,7 @@ export default function AskPage() {
                 ))}
               </div>
             </div>
+            )
           )}
 
           {messages.map((m, i) => (
@@ -156,6 +196,7 @@ export default function AskPage() {
                 <StepCard
                   visible
                   inWizard={inWizard}
+                  intent={intent}
                   disabled={isAsking}
                   onAction={(msg, mode) => send(msg, mode)}
                 />
@@ -184,7 +225,7 @@ export default function AskPage() {
                   send(input);
                 }
               }}
-              placeholder="Describe the problem…"
+              placeholder={intent === "learn" ? "Ask how something works…" : "Describe the problem…"}
               className="max-h-40 flex-1 resize-none rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none focus:border-orange-500"
             />
             <button

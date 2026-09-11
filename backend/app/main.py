@@ -40,9 +40,31 @@ def init_db() -> None:
     except Exception as e:
         logger.warning("Could not ensure pgvector extension: %s", e)
 
+    # create_all() only creates missing TABLES, never missing columns, so columns
+    # added after a database was first initialised need an explicit nudge.
+    def _add_missing_columns() -> None:
+        statements = [
+            "ALTER TABLE assistant_sessions ADD COLUMN IF NOT EXISTS intent VARCHAR",
+            "ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS figure_role VARCHAR",
+            "ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS parent_path VARCHAR",
+            "ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS width INTEGER",
+            "ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS height INTEGER",
+            "ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS kind VARCHAR",
+            "ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS render_markdown TEXT",
+            "ALTER TABLE assistant_messages ADD COLUMN IF NOT EXISTS attachments TEXT",
+        ]
+        try:
+            with engine.connect() as conn:
+                for stmt in statements:
+                    conn.execute(text(stmt))
+                conn.commit()
+        except Exception as e:
+            logger.warning("Column migration skipped: %s", e)
+
     for attempt in range(3):
         try:
             Base.metadata.create_all(bind=engine)
+            _add_missing_columns()
             logger.info("✅ Database tables verified.")
             return
         except Exception as e:

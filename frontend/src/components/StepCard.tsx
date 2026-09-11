@@ -1,6 +1,7 @@
 "use client";
 
-import { CheckCircle2, HelpCircle, Wrench } from "lucide-react";
+import { CheckCircle2, HelpCircle, Wrench, GraduationCap, RefreshCw } from "lucide-react";
+import { ChatIntent } from "../store/slices/assistantSlice";
 
 interface StepCardProps {
   onAction: (message: string, mode: "answer" | "wizard") => void;
@@ -9,6 +10,8 @@ interface StepCardProps {
   visible: boolean;
   /** The wizard is already running, so offer progress actions instead of starting it. */
   inWizard: boolean;
+  /** Repair and learning walkthroughs need different wording and different asks. */
+  intent?: ChatIntent | null;
 }
 
 /**
@@ -17,23 +20,56 @@ interface StepCardProps {
  * These send ordinary messages rather than a bespoke protocol — the retrieval
  * prompt already adapts to "done" versus "stuck" from the conversation history.
  */
-export default function StepCard({ onAction, disabled, visible, inWizard }: StepCardProps) {
+export default function StepCard({ onAction, disabled, visible, inWizard, intent }: StepCardProps) {
   if (!visible) return null;
 
+  const learning = intent === "learn";
+
+  // A learning walkthrough is not a repair: "done — next step" and "walk me
+  // through fixing this" are the wrong asks when nothing is broken.
   const actions = inWizard
+    ? learning
+      ? [
+          {
+            label: "Got it — continue",
+            icon: CheckCircle2,
+            tone: "sky",
+            message: "That makes sense. Continue to the next part of the explanation.",
+            mode: "wizard" as const,
+          },
+          {
+            label: "Explain differently",
+            icon: RefreshCw,
+            tone: "amber",
+            message:
+              "I did not follow that. Explain the same point again in simpler terms, with a different example and any diagram that helps.",
+            mode: "wizard" as const,
+          },
+        ]
+      : [
+          {
+            label: "Done — next step",
+            icon: CheckCircle2,
+            tone: "emerald",
+            message: "I have completed that step. What is the next one?",
+            mode: "wizard" as const,
+          },
+          {
+            label: "I'm stuck",
+            icon: HelpCircle,
+            tone: "amber",
+            message: "I am stuck on that step. Explain it in simpler detail and show any diagram.",
+            mode: "wizard" as const,
+          },
+        ]
+    : learning
     ? [
         {
-          label: "Done — next step",
-          icon: CheckCircle2,
-          tone: "emerald",
-          message: "I have completed that step. What is the next one?",
-          mode: "wizard" as const,
-        },
-        {
-          label: "I'm stuck",
-          icon: HelpCircle,
-          tone: "amber",
-          message: "I am stuck on that step. Explain it in simpler detail and show any diagram.",
+          label: "Teach me step by step",
+          icon: GraduationCap,
+          tone: "sky",
+          message:
+            "Teach me how this works step by step, one part at a time. Start with the overall purpose and the full diagram, then take each component in turn.",
           mode: "wizard" as const,
         },
       ]
@@ -51,6 +87,7 @@ export default function StepCard({ onAction, disabled, visible, inWizard }: Step
     emerald: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20",
     amber: "border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20",
     orange: "border-orange-500/30 bg-orange-500/10 text-orange-400 hover:bg-orange-500/20",
+    sky: "border-sky-500/30 bg-sky-500/10 text-sky-400 hover:bg-sky-500/20",
   };
 
   return (

@@ -1,9 +1,7 @@
 import json
-from unified_rag.ai_client import get_client, MODEL_CHAT_LIGHT
+from unified_rag.ai_client import chat_text, MODEL_CHAT_LIGHT
 
 class TableTransformer:
-    def __init__(self):
-        self.client = get_client()
 
     def summarize_table(self, table_json: str, context: str = "") -> str:
         """
@@ -18,16 +16,19 @@ class TableTransformer:
         )
         
         try:
-            response = self.client.chat.completions.create(
-                model=MODEL_CHAT_LIGHT,
-                messages=[
-                    {"role": "system", "content": "You convert structured technical data into dense, searchable text summaries."},
-                    {"role": "user", "content": f"{prompt}\n\nRAW TABLE DATA:\n{table_json}"}
-                ],
-                max_tokens=400,
-                temperature=0.0
-            )
-            summary = response.choices[0].message.content.strip()
+            # 400 tokens through the OpenAI-compatible endpoint is not enough for a
+            # local reasoning model to get past its own thinking; chat_text() uses
+            # the native endpoint where thinking is actually suppressed.
+            summary = (chat_text(
+                MODEL_CHAT_LIGHT,
+                f"{prompt}\n\nRAW TABLE DATA:\n{table_json}",
+                system="You convert structured technical data into dense, searchable text summaries.",
+                max_tokens=700,
+                temperature=0.0,
+            ) or "").strip()
+            if not summary:
+                # Never store an empty chunk: the raw grid is still searchable text.
+                return f"Table data: {table_json[:800]}"
             return summary
         except Exception as e:
             print(f"❌ [TableTransformer] Error summarizing table: {e}")

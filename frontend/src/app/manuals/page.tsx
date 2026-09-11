@@ -3,7 +3,13 @@
 import { useEffect, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
 import { AppDispatch, RootState } from "../../store/store";
-import { fetchManuals, uploadManual, clearStatus } from "../../store/slices/manualsSlice";
+import {
+  fetchManuals,
+  uploadManual,
+  deleteManual,
+  renameManual,
+  clearStatus,
+} from "../../store/slices/manualsSlice";
 import {
   BookOpen,
   UploadCloud,
@@ -12,11 +18,28 @@ import {
   CheckCircle2,
   AlertTriangle,
   ExternalLink,
+  Trash2,
+  Pencil,
+  Check,
+  X,
 } from "lucide-react";
 
 export default function ManualsPage() {
   const dispatch = useDispatch<AppDispatch>();
   const { items, isUploading, status, error } = useSelector((s: RootState) => s.manuals);
+  // Which row is mid-rename, and the pending confirm for a destructive delete.
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  const submitRename = (manualId: string) => {
+    const next = renameValue.trim();
+    if (!next || next === manualId) {
+      setRenaming(null);
+      return;
+    }
+    dispatch(renameManual({ manualId, newManualId: next })).then(() => setRenaming(null));
+  };
 
   const [manualId, setManualId] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -146,15 +169,45 @@ export default function ManualsPage() {
                   <th className="px-5 py-3 text-[10px] font-black uppercase tracking-widest text-slate-500">Manual</th>
                   <th className="px-5 py-3 text-[10px] font-black uppercase tracking-widest text-slate-500">File</th>
                   <th className="px-5 py-3 text-right text-[10px] font-black uppercase tracking-widest text-slate-500">Sections</th>
+                  <th className="px-5 py-3 text-right text-[10px] font-black uppercase tracking-widest text-slate-500">Manage</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
                 {items.map((m) => (
                   <tr key={m.manual_id} className="hover:bg-slate-800/20">
                     <td className="px-5 py-4">
-                      <span className="rounded-lg border border-orange-400/20 bg-orange-400/5 px-2 py-1 font-mono text-xs font-bold text-orange-400">
-                        {m.manual_id}
-                      </span>
+                      {renaming === m.manual_id ? (
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            autoFocus
+                            value={renameValue}
+                            onChange={(e) => setRenameValue(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") submitRename(m.manual_id);
+                              if (e.key === "Escape") setRenaming(null);
+                            }}
+                            className="w-40 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-xs text-white outline-none focus:border-orange-500"
+                          />
+                          <button
+                            onClick={() => submitRename(m.manual_id)}
+                            aria-label="Save name"
+                            className="rounded-lg p-1 text-emerald-400 hover:bg-emerald-500/10"
+                          >
+                            <Check size={14} />
+                          </button>
+                          <button
+                            onClick={() => setRenaming(null)}
+                            aria-label="Cancel rename"
+                            className="rounded-lg p-1 text-slate-500 hover:bg-slate-800"
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      ) : (
+                        <span className="rounded-lg border border-orange-400/20 bg-orange-400/5 px-2 py-1 font-mono text-xs font-bold text-orange-400">
+                          {m.manual_id}
+                        </span>
+                      )}
                     </td>
                     <td className="px-5 py-4">
                       {m.url ? (
@@ -175,11 +228,57 @@ export default function ManualsPage() {
                         {m.chunks > 0 ? m.chunks : "empty"}
                       </span>
                     </td>
+                    <td className="px-5 py-4">
+                      {confirmDelete === m.manual_id ? (
+                        <div className="flex items-center justify-end gap-2">
+                          <span className="text-[11px] text-slate-400">
+                            Delete {m.chunks} sections?
+                          </span>
+                          <button
+                            onClick={() => {
+                              dispatch(deleteManual(m.manual_id));
+                              setConfirmDelete(null);
+                            }}
+                            className="rounded-lg bg-red-600 px-2.5 py-1 text-[11px] font-bold text-white hover:bg-red-500"
+                          >
+                            Delete
+                          </button>
+                          <button
+                            onClick={() => setConfirmDelete(null)}
+                            className="rounded-lg border border-slate-700 px-2.5 py-1 text-[11px] font-bold text-slate-300 hover:bg-slate-800"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            onClick={() => {
+                              setRenaming(m.manual_id);
+                              setRenameValue(m.manual_id);
+                            }}
+                            aria-label={`Rename ${m.manual_id}`}
+                            title="Rename"
+                            className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white"
+                          >
+                            <Pencil size={14} />
+                          </button>
+                          <button
+                            onClick={() => setConfirmDelete(m.manual_id)}
+                            aria-label={`Delete ${m.manual_id}`}
+                            title="Delete manual and all its sections"
+                            className="rounded-lg p-1.5 text-slate-400 hover:bg-red-500/10 hover:text-red-400"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      )}
+                    </td>
                   </tr>
                 ))}
                 {items.length === 0 && (
                   <tr>
-                    <td colSpan={3} className="px-5 py-12 text-center text-sm italic text-slate-600">
+                    <td colSpan={4} className="px-5 py-12 text-center text-sm italic text-slate-600">
                       No manuals yet. Upload one to get started.
                     </td>
                   </tr>

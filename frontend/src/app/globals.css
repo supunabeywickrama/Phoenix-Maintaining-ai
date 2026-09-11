@@ -44,3 +44,11 @@ html, body {
 .answer th, .answer td { border: 1px solid #334155; padding: .5rem .65rem; text-align: left; }
 .answer th { background: #1e293b; font-weight: 700; }
 .answer hr { border-color: #334155; margin: 1.25rem 0; }
+
+/* Tables lifted straight out of a manual are often wide and dense (fault-code
+   grids, torque schedules). Keep cells on one line and let the wrapper scroll
+   rather than wrapping every cell into an unreadable stack. */
+.answer-table table { margin-bottom: 0; font-size: .78rem; }
+.answer-table th, .answer-table td { padding: .35rem .55rem; white-space: nowrap; }
+.answer-table tr:nth-child(even) td { background: rgba(30, 41, 59, .35); }
+.answer-table p { margin: 0; }
