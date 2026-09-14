@@ -748,6 +748,7 @@ class DocumentParser:
         before. On a scanned page with no text layer the list is read by vision
         and flagged unverified.
         """
+        scanned_checked = set()   # scanned pages already tried, list or not
         for fig in figures:
             page = fig["page"]
             chunk = fig["chunk"]
@@ -758,31 +759,35 @@ class DocumentParser:
 
             window = [p for p in (page, page + 1, page + 2, page - 1) if 1 <= p <= len(doc)]
             candidates = [parts_lists[p] for p in window if p in parts_lists]
-            if not candidates:
-                for p in window:
-                    if p in parts_lists or page_has_text_layer(doc[p - 1]):
-                        continue
-                    # Scanned page: OCR rows, each checked against a vision read
-                    # (services/parts_list.read_scanned). Only pages next to a
-                    # numbered figure are read, since OCR costs ~25 s a page.
-                    pl = read_scanned(doc[p - 1])
-                    if pl:
-                        parts_lists[p] = pl
-                        candidates.append(pl)
-                        # The scanned list is also stored as a table, with a
-                        # "Reading" column saying how far each row is confirmed.
-                        parsed_data.append({
-                            "type": "table", "page": p,
-                            "content": pl.to_text(),
-                            "kind": "table",
-                            "render_markdown": pl.to_markdown(),
-                            "metadata": {
-                                "title": " ".join(filter(None, [pl.title, pl.subtitle])) or "Parts list",
-                                "caption": pl.subtitle,
-                                "parts_list": True,
-                                "verified": False,
-                            },
-                        })
+            # Every unread scanned page in the window is read - not only when
+            # nothing was found. A neighbouring figure's list already loaded (the
+            # Counterweight list on the page before) used to stop the Caliper
+            # Brake Kit's own list on the page after from ever being read.
+            for p in window:
+                if p in parts_lists or p in scanned_checked or page_has_text_layer(doc[p - 1]):
+                    continue
+                scanned_checked.add(p)
+                # Scanned page: OCR rows, each checked against a vision read
+                # (services/parts_list.read_scanned). Only pages next to a
+                # numbered figure are read, since OCR costs ~25 s a page.
+                pl = read_scanned(doc[p - 1])
+                if pl:
+                    parts_lists[p] = pl
+                    candidates.append(pl)
+                    # The scanned list is also stored as a table, with a
+                    # "Reading" column saying how far each row is confirmed.
+                    parsed_data.append({
+                        "type": "table", "page": p,
+                        "content": pl.to_text(),
+                        "kind": "table",
+                        "render_markdown": pl.to_markdown(),
+                        "metadata": {
+                            "title": " ".join(filter(None, [pl.title, pl.subtitle])) or "Parts list",
+                            "caption": pl.subtitle,
+                            "parts_list": True,
+                            "verified": False,
+                        },
+                    })
 
             match = match_parts_list(fig["page_text"], fig["callouts"], candidates)
             if not match:

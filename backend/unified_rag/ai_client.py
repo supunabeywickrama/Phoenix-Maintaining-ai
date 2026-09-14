@@ -54,21 +54,47 @@ def _ollama_native(model: str, prompt: str, image_b64: Optional[str], max_tokens
         user_msg["images"] = [image_b64]
     messages.append(user_msg)
 
+    num_ctx = settings.ollama_num_ctx
     payload = {
         "model": model,
         "messages": messages,
         "think": False,
-        "options": {"temperature": temperature, "num_predict": max_tokens},
+        "options": {"temperature": temperature, "num_predict": max_tokens, "num_ctx": num_ctx},
         "stream": False,
     }
     if json_mode:
         payload["format"] = "json"
 
-    r = requests.post(f"{base}/api/chat", json=payload, timeout=180)
-    r.raise_for_status()
+    r = requests.post(f"{base}/api/chat", json=payload, timeout=300)
+    if r.status_code == 400 and "exceed" in r.text and "context" in r.text:
+        # One oversize request - retry with a window big enough for it rather
+        # than failing the figure. (A different num_ctx makes Ollama reload the
+        # model once, so this is a fallback, not the normal path.)
+        m = re.search(r'"n_prompt_tokens"\s*:\s*(\d+)', r.text)
+        needed = (int(m.group(1)) if m else num_ctx) + max_tokens + 512
+        bigger = num_ctx
+        while bigger < needed and bigger < MAX_NUM_CTX:
+            bigger *= 2
+        if bigger > num_ctx:
+            print(f"      ⚠️ [Ollama] {model}: request needs ~{needed} tokens, over the "
+                  f"{num_ctx}-token window - retrying with {bigger}. Raise OLLAMA_NUM_CTX "
+                  f"in .env if this happens often.")
+            payload["options"]["num_ctx"] = bigger
+            r = requests.post(f"{base}/api/chat", json=payload, timeout=300)
+    if not r.ok:
+        # Ollama's own message ("request (5648 tokens) exceeds the available
+        # context size...") instead of a bare "400 Client Error: Bad Request".
+        try:
+            detail = r.json().get("error")
+            detail = detail.get("message") if isinstance(detail, dict) else detail
+        except ValueError:
+            detail = r.text[:300]
+        raise RuntimeError(f"Ollama {r.status_code} for {model}: {detail}")
     msg = r.json().get("message", {})
     return _strip_reasoning(msg.get("content")) or _strip_reasoning(msg.get("thinking"))
 
+
+MAX_NUM_CTX = 65536   # ceiling for the automatic retry on an oversize request
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _THINK_UNCLOSED = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)

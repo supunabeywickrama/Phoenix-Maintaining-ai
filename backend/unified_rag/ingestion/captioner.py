@@ -243,13 +243,20 @@ class ImageCaptioner:
             # Structured mode failed — fall back to a plain prose caption rather
             # than storing an empty chunk that can never be retrieved.
             print(f"      ↩️ [Vision] Falling back to prose caption for {label}")
-            caption = (chat_text(
-                MODEL_VISION,
-                f"{context_str}{grounding}\n\nDescribe this technical component in 80-150 words for a "
-                "maintenance technician: what it is, its function, visible labels and part codes, "
-                "and the faults this diagram helps diagnose.",
-                image_b64=b64, max_tokens=900, temperature=0.2,
-            ) or "").strip()
+            try:
+                caption = (chat_text(
+                    MODEL_VISION,
+                    f"{context_str}{grounding}\n\nDescribe this technical component in 80-150 words for a "
+                    "maintenance technician: what it is, its function, visible labels and part codes, "
+                    "and the faults this diagram helps diagnose.",
+                    image_b64=b64, max_tokens=900, temperature=0.2,
+                ) or "").strip()
+            except Exception as e:
+                # One figure's failed call must not abort the whole manual:
+                # captioning runs inside asyncio.gather, where an unhandled
+                # error here failed every other figure's ingestion with it.
+                print(f"      ⚠️ [Vision] Prose caption failed for {label} (page {page}): {e}")
+                caption = ""
             component, codes, leader_labels, kind = label, [], [], "diagram"
 
         if not caption and not groups:

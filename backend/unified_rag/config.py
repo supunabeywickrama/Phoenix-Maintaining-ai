@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     model_vision: str = Field("qwen-vl-max", alias="MODEL_VISION")
     model_embedding: str = Field("text-embedding-v4", alias="MODEL_EMBEDDING")
     embedding_dim: int = Field(2048, alias="EMBEDDING_DIM")
+    # Context window requested from a local Ollama for chat/vision calls.
+    # Ollama runs every model at 4096 tokens unless told otherwise, even though
+    # these Qwen models support 262k - and a figure image (~2100 tokens) plus a
+    # 35-part list failed ingestion with HTTP 400 "request (5648 tokens) exceeds
+    # the available context size (4096 tokens)". 16k fits the largest request
+    # the app makes (a chat answer carrying parts lists, ~11k) and adds about
+    # 2 GB of GPU memory over 4k. Lower it on a small GPU; oversize requests
+    # are retried once with a bigger window.
+    ollama_num_ctx: int = Field(16384, alias="OLLAMA_NUM_CTX")
 
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     # Optional Service Overrides
