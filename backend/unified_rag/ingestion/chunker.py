@@ -107,6 +107,19 @@ class ContextualChunker:
                         "metadata": meta,
                     })
                 
+            # 2b. Handle parts-list entries: one per ref, already the right size,
+            #     never split - each is meant to be exactly one searchable part.
+            elif item["type"] == "part":
+                chunks.append({
+                    "manual_id": manual_id,
+                    "type": "part",
+                    "content": item["content"],
+                    "page": item["page"],
+                    "kind": "part",
+                    "parent_path": item.get("parent_path"),
+                    "metadata": item.get("metadata", {}),
+                })
+
             # 3. Handle Images (Single or Sub-Figures)
             elif item["type"] == "image":
                 chunks.append({

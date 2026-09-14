@@ -27,11 +27,10 @@ MIN_CROSS_MANUAL_RELEVANCE = 1 - 0.45
 # machine tripped" (0.536), a genuine repeat.
 MIN_MEMORY_RELEVANCE = 0.47
 
-# A component crop this small is unreadable on a phone in a plant; SAM
-# sometimes isolates a bolt head or a fragment of a label. It stays in the
-# index (the caption is still searchable) but is not shown in chat.
-MIN_PART_SIDE = 80
-MIN_PART_AREA = 12000
+# Part numbers as printed in parts lists: "6710415", "17C-612", "83FN-3".
+# Pulled out of a question for an exact lookup, since an embedding of a bare
+# code carries little meaning to match on.
+_PART_NUMBER = re.compile(r"\b(?:\d{6,8}|[0-9]{1,3}[A-Z]{1,3}-\d{1,4}[A-Z]?)\b", re.IGNORECASE)
 
 
 def _is_part(chunk) -> bool:
@@ -54,16 +53,6 @@ def _resolved_codes(content: str) -> list:
         if code:
             codes.append(code)
     return codes
-
-
-def _too_small_to_show(chunk) -> bool:
-    """Only applied to parts; a full figure is shown whatever its size."""
-    if not _is_part(chunk):
-        return False
-    w, h = chunk.width, chunk.height
-    if not w or not h:
-        return False  # pre-dates the size fields, so do not guess
-    return w < MIN_PART_SIDE or h < MIN_PART_SIDE or (w * h) < MIN_PART_AREA
 
 
 class RetrievalEngine:
@@ -89,17 +78,27 @@ class RetrievalEngine:
         """
         query_emb = embedder.embed_text(query)
 
-        # 1. Search this manual (theory)
+        # 1. Search this manual (theory). "part" = one parts-list entry.
         try:
             text_results = qs.search_manual_chunks(
-                query_emb, manual_id=manual_id, types=["text", "table"], limit=self.top_k_text
+                query_emb, manual_id=manual_id, types=["text", "table", "part"], limit=self.top_k_text
             )
         except Exception as e:
             print(f"Error retrieving text: {e}")
             text_results = []
 
-        # 2. Images: relevance-gated, size-filtered, ordered full-before-parts
+        # 1b. A part number named in the question is looked up exactly and put
+        #     first - "what is 6710415?" should never depend on vector luck.
+        exact = self._exact_part_matches(query, manual_id)
+        exact_ids = {e.id for e in exact}
+        text_results = exact + [c for c in text_results if c.id not in exact_ids]
+
+        # 2. Images: relevance-gated, ordered full-before-parts
         image_results = self._retrieve_images(query_emb, manual_id)
+
+        # 2a. A matched parts-list entry brings the drawing it is a callout on,
+        #     so an answer about "the caliper hose" can show where ref 30 is.
+        image_results = self._with_part_figures(text_results, image_results, manual_id)
 
         # 2b. Tables get their own slots. Sharing the text budget meant a torque
         #     schedule lost to three paragraphs of prose and was never shown, even
@@ -123,6 +122,33 @@ class RetrievalEngine:
             "historical_fixes": historical_fixes,
             "cross_manual": cross_refs,
         }
+
+    def _exact_part_matches(self, query: str, manual_id: str) -> list:
+        numbers = sorted({m.group(0).upper() for m in _PART_NUMBER.finditer(query or "")})
+        if not numbers or not manual_id:
+            return []
+        try:
+            return qs.get_parts_by_number(manual_id, numbers)
+        except Exception as e:
+            print(f"Error in exact part-number lookup: {e}")
+            return []
+
+    def _with_part_figures(self, text_results: list, image_results: list, manual_id: str) -> list:
+        wanted = {}
+        for c in text_results:
+            if c.type == "part" and c.parent_path:
+                wanted[c.parent_path] = max(wanted.get(c.parent_path, 0.0), c.relevance or 0.0)
+        missing = [p for p in wanted if p not in {i.path for i in image_results}]
+        if not missing:
+            return image_results
+        try:
+            figures = qs.get_manual_chunks_by_path(manual_id, missing)
+        except Exception as e:
+            print(f"Error fetching figures for matched parts: {e}")
+            return image_results
+        for f in figures:
+            f.relevance = wanted.get(f.path, 0.0)
+        return self._order_full_first(image_results + figures)
 
     def _retrieve_memory(self, query_emb, machine_id: str):
         if not machine_id:
@@ -167,7 +193,7 @@ class RetrievalEngine:
             try:
                 emb = embedder.embed_text(q)
                 for c in qs.search_manual_chunks(
-                    emb, manual_id=manual_id, types=["text", "table"], limit=self.top_k_text
+                    emb, manual_id=manual_id, types=["text", "table", "part"], limit=self.top_k_text
                 ):
                     keep_best(text_by_id, c)
                 for c in self._retrieve_tables(emb, manual_id):
@@ -195,7 +221,9 @@ class RetrievalEngine:
         for chunk in candidates:  # already sorted best-first by Qdrant
             if chunk.relevance is not None and chunk.relevance < MIN_IMAGE_RELEVANCE:
                 break
-            if chunk.path in seen_paths or _too_small_to_show(chunk):
+            # No size-based hiding: whether a figure is worth showing is decided
+            # by vision at ingestion and the relevance check at answer time.
+            if chunk.path in seen_paths:
                 continue
             seen_paths.add(chunk.path)
             picked.append(chunk)
@@ -395,7 +423,7 @@ class RetrievalEngine:
         """
         try:
             candidates = qs.search_manual_chunks(
-                query_emb, exclude_manual_id=manual_id, types=["text", "table", "image"],
+                query_emb, exclude_manual_id=manual_id, types=["text", "table", "image", "part"],
                 limit=self.top_k_cross * 3,
             )
         except Exception as e:

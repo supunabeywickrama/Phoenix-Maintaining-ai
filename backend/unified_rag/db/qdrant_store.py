@@ -81,6 +81,15 @@ def ensure_collections() -> None:
             INTERACTION_MEMORY, field_name="machine_id", field_schema=qm.PayloadSchemaType.KEYWORD
         )
 
+    # Exact part-number lookup for parts-list entries. Added after the
+    # collection first shipped, so applied to existing collections too.
+    try:
+        client.create_payload_index(
+            MANUAL_CHUNKS, field_name="part_numbers", field_schema=qm.PayloadSchemaType.KEYWORD
+        )
+    except Exception:
+        pass
+
     # Added after the collection first shipped, so applied to existing
     # collections too. Creating an index that already exists is a no-op
     # server-side; the except only covers servers that reject the repeat.
@@ -97,7 +106,8 @@ class ChunkResult:
     (cosine similarity, 0-1, higher is better) — mirrors the old
     `chunk.relevance = 1.0 - distance` pattern retriever.py already used."""
     __slots__ = ("id", "manual_id", "type", "content", "page", "path", "figure_role",
-                 "parent_path", "width", "height", "kind", "render_markdown", "relevance")
+                 "parent_path", "width", "height", "kind", "render_markdown", "relevance",
+                 "ref", "part_numbers")
 
     def __init__(self, id, payload: dict, score: Optional[float] = None):
         p = payload or {}
@@ -113,6 +123,8 @@ class ChunkResult:
         self.height = p.get("height")
         self.kind = p.get("kind")
         self.render_markdown = p.get("render_markdown")
+        self.ref = p.get("ref")
+        self.part_numbers = p.get("part_numbers") or []
         self.relevance = score
 
 
@@ -170,6 +182,9 @@ def _chunk_payload(**fields) -> dict:
         "height": fields.get("height"),
         "kind": fields.get("kind"),
         "render_markdown": fields.get("render_markdown"),
+        # Parts-list entries ("part" chunks) only.
+        "ref": fields.get("ref"),
+        "part_numbers": fields.get("part_numbers"),
     }
 
 
@@ -264,6 +279,23 @@ def get_manual_chunks_by_path(manual_id: str, paths: list) -> list:
         with_payload=True,
     )
     return [ChunkResult(h.id, h.payload) for h in hits]
+
+
+def get_parts_by_number(manual_id: str, part_numbers: list, limit: int = 10) -> list:
+    """Parts-list entries whose part number is exactly one of these. A vector
+    search is unreliable on codes like "17C-612"; this is not."""
+    if not part_numbers:
+        return []
+    hits, _ = get_client().scroll(
+        collection_name=MANUAL_CHUNKS,
+        scroll_filter=qm.Filter(must=[
+            qm.FieldCondition(key="manual_id", match=qm.MatchValue(value=manual_id)),
+            qm.FieldCondition(key="part_numbers", match=qm.MatchAny(any=part_numbers)),
+        ]),
+        limit=limit,
+        with_payload=True,
+    )
+    return [ChunkResult(h.id, h.payload, 1.0) for h in hits]
 
 
 def get_manual_tables_near(manual_id: str, pages: list) -> list:

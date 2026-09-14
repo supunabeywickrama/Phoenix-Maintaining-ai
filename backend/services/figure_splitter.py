@@ -159,7 +159,10 @@ class FigureSplitter:
                 bx, by, bw, bh = xmin_v, ymin_v, (xmax_v - xmin_v), (ymax_v - ymin_v)
                 final_mask[by:by+bh, bx:bx+bw] = 255
 
-            if bw * bh < min_area: continue
+            # No minimum-size rule: whether a piece is a real view is judged by
+            # vision in the parser, not by its pixel count. Only a degenerate
+            # zero-size box (nothing to crop) is skipped.
+            if bw <= 0 or bh <= 0: continue
 
             # Extraction
             crop_rgba = np.zeros((bh, bw, 4), dtype=np.uint8)

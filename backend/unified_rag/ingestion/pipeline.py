@@ -47,11 +47,18 @@ async def process_manual_async(file_path: str, manual_id: str):
             meta["page"] = chunk.get("page")
             result = await asyncio.to_thread(captioner.describe, chunk["path"], meta)
             chunk["content"] = result["caption"]
+            meta["parts_resolved"] = result.get("parts_resolved", False)
             meta["codes"] = result["codes"]
             meta["component"] = result["component"]
             meta["kind"] = result.get("kind", "diagram")
             chunk["kind"] = result.get("kind", "diagram")
             chunk["metadata"] = meta
+        elif chunk["type"] == "table" and (chunk.get("metadata") or {}).get("parts_list"):
+            # A parts list is already clean, readable text straight from the
+            # printed page. An LLM summary adds nothing and can only paraphrase
+            # a part number wrong, so it is stored as read.
+            meta = chunk["metadata"]
+            chunk["content"] = f"### Table — {meta.get('title', 'Parts list')}\n\n{chunk['content']}"
         elif chunk["type"] == "table":
             meta = chunk.get("metadata") or {}
             # parser.py derives this from the table's own caption/header rather
@@ -150,6 +157,10 @@ async def process_manual_async(file_path: str, manual_id: str):
             "parent_path": chunk.get("parent_path"),
             "width": chunk.get("width"),
             "height": chunk.get("height"),
+            # Parts-list entries: exact-match lookup by part number, which a
+            # vector alone does badly on codes like "17C-612".
+            "ref": (chunk.get("metadata") or {}).get("ref"),
+            "part_numbers": (chunk.get("metadata") or {}).get("part_numbers"),
         })
         if len(buffer) >= BATCH:
             flush()

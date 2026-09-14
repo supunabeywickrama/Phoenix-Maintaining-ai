@@ -118,8 +118,32 @@ def chat_text(model: str, prompt: str, image_b64: Optional[str] = None, max_toke
     Routes to Ollama's native API when running locally (see _ollama_native for
     why); hosted providers keep the normal OpenAI-compatible path unchanged.
     """
-    fn = _ollama_native if is_local_ollama() else _openai_compat
-    return fn(model, prompt, image_b64, max_tokens, temperature, False, system)
+    if not is_local_ollama():
+        return _openai_compat(model, prompt, image_b64, max_tokens, temperature, False, system)
+
+    text = _ollama_native(model, prompt, image_b64, max_tokens, temperature, False, system)
+    if text:
+        return text
+    # Local Qwen3 models sometimes ignore think:false in plain-text mode and
+    # spend the entire budget reasoning, leaving no answer (reproduced with
+    # qwen3-vl on an exploded-view figure: done_reason=length, empty content,
+    # 700 tokens of "thinking"). JSON mode reliably makes them answer directly,
+    # so retry once through it and unwrap the text.
+    wrapped = _ollama_native(
+        model,
+        prompt + '\n\nReturn your complete answer as JSON: {"text": "<your answer>"}',
+        image_b64, max_tokens, temperature, True, system,
+    )
+    if not wrapped:
+        return None
+    from services.llm_json import loads_tolerant
+    data = loads_tolerant(wrapped)
+    if isinstance(data, dict):
+        value = data.get("text") or next(
+            (v for v in data.values() if isinstance(v, str) and v.strip()), ""
+        )
+        return str(value).strip() or None
+    return None
 
 
 def chat_json(model: str, text_prompt: str, image_b64: Optional[str] = None, max_tokens: int = 2000,

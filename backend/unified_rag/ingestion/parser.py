@@ -1,3 +1,4 @@
+import copy
 import fitz  # PyMuPDF
 import io
 import logging
@@ -154,6 +155,193 @@ def _df_to_text(df, caption: str = "") -> str:
 
 from services.table_validator import is_valid_table
 
+# A "composite" figure split into more pieces than this was really one assembly
+# drawing (the Cab Windows exploded view came back as ~50 pieces) - kept whole.
+MAX_SPLIT_VIEWS = 6
+
+_DRAWING_CODE = re.compile(r"^[A-Z]{1,3}-{1,2}\d{2,6}$")
+
+
+def _expand_to_frame(page_bgr, box, pad_ratio=0.015):
+    """Grow a layout-model figure box out to the rectangular frame drawn around
+    the figure, if there is one; otherwise add a small margin.
+
+    Not every figure has a frame, so both cases are handled. This only moves
+    the crop's edges outward - it never drops anything. Verified on the 873
+    parts manual: the raw layout box cut off callout 28 on Cab Windows (p.226),
+    callout 30 on the Caliper Brake Kit (p.246) and the drawing codes on both;
+    the frame-grown crop contains all of them. On an unframed figure (TPM-750
+    p.14) the margin recovered a clipped "1 000 mm" dimension label.
+    """
+    H, W = page_bgr.shape[:2]
+    x1, y1, x2, y2 = box
+    bw, bh = max(x2 - x1, 1), max(y2 - y1, 1)
+    gray = cv2.cvtColor(page_bgr, cv2.COLOR_BGR2GRAY)
+    ink = (gray < 160).astype(np.uint8) * 255
+    # Long straight strokes only: a frame is made of lines at least half the
+    # figure's width/height, which leader lines and part outlines are not.
+    horiz = cv2.morphologyEx(ink, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, int(bw * 0.5)), 1)))
+    vert = cv2.morphologyEx(ink, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, int(bh * 0.5)))))
+    lines = cv2.dilate(cv2.bitwise_or(horiz, vert), np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(lines, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    best = None
+    for c in contours:
+        fx, fy, fw, fh = cv2.boundingRect(c)
+        ix = max(0, min(x2, fx + fw) - max(x1, fx))
+        iy = max(0, min(y2, fy + fh) - max(y1, fy))
+        covers = (ix * iy) / float(bw * bh)
+        size_ratio = (fw * fh) / float(bw * bh)
+        # The frame must hold nearly all of the detected figure and be about
+        # its size - not the page border or a table ruling elsewhere.
+        if covers >= 0.9 and 0.8 <= size_ratio <= 1.6:
+            if best is None or fw * fh < best[2] * best[3]:
+                best = (fx, fy, fw, fh)
+    if best:
+        fx, fy, fw, fh = best
+        m = 4
+        return (max(0, fx - m), max(0, fy - m), min(W, fx + fw + m), min(H, fy + fh + m)), "frame"
+    px, py = int(W * pad_ratio), int(H * pad_ratio)
+    return (max(0, x1 - px), max(0, y1 - py), min(W, x2 + px), min(H, y2 + py)), "no frame, padded"
+
+
+FURNITURE_BAND = 0.08        # top/bottom share of the page where headers/footers sit
+FURNITURE_MIN_PAGES = 3
+FURNITURE_MIN_SHARE = 0.30   # ...and on at least this share of all pages
+
+
+def _furniture_key(text: str) -> str:
+    """Page numbers and other digits masked, so "225 Model 873" == "226 Model 873"."""
+    return re.sub(r"\d+", "#", " ".join((text or "").lower().replace("--", "-").split())).strip()
+
+
+def _page_furniture(doc) -> set:
+    """Running header/footer lines, found from the printed text of EVERY page.
+
+    Counting repeated text chunks instead (the first version) needed the
+    footer to become a chunk on 3+ pages; on a test run only 2 pages produced
+    one, so "Model 873 G--Series" stayed in the index. Here each page's own
+    text in the top and bottom bands is looked at directly, so a footer is
+    recognised however few chunks it happened to end up in.
+    """
+    counts = {}
+    for page in doc:
+        height = page.rect.height
+        seen = set()
+        for block in page.get_text("dict").get("blocks", []):
+            for line in block.get("lines", []):
+                y0, y1 = line["bbox"][1], line["bbox"][3]
+                if y1 <= height * FURNITURE_BAND or y0 >= height * (1 - FURNITURE_BAND):
+                    key = _furniture_key(" ".join(s["text"] for s in line["spans"]))
+                    if key and key != "#":
+                        seen.add(key)
+        for key in seen:
+            counts[key] = counts.get(key, 0) + 1
+    need = max(FURNITURE_MIN_PAGES, int(len(doc) * FURNITURE_MIN_SHARE))
+    return {k for k, c in counts.items() if c >= need}
+
+
+def _drop_page_furniture(parsed_data: list, doc) -> list:
+    """Remove text chunks made up entirely of running headers/footers and page
+    numbers. A chunk with any real content on top of the footer is kept."""
+    if len(doc) < FURNITURE_MIN_PAGES:
+        return parsed_data
+    furniture = _page_furniture(doc)
+    if not furniture:
+        return parsed_data
+
+    def only_furniture(content: str) -> bool:
+        pieces = [p for p in re.split(r"\n| \| ", (content or "").replace("Page contents:", "")) if p.strip()]
+        return bool(pieces) and all(
+            _furniture_key(p) in furniture or re.fullmatch(r"#+", _furniture_key(p)) for p in pieces
+        )
+
+    kept = [item for item in parsed_data
+            if not (item.get("type") == "text" and only_furniture(item.get("content")))]
+    dropped = len(parsed_data) - len(kept)
+    if dropped:
+        print(f"      [Parser] Dropped {dropped} header/footer-only text chunk(s); "
+              f"furniture lines: {sorted(furniture)[:4]}")
+    return kept
+
+
+VIEW_GAP_RATIO = 0.03       # blank band, as a share of the figure, that separates views
+VIEW_CAPTION_RATIO = 0.12   # a band shorter than this is a caption, joined to its view
+
+
+def _split_views(crop) -> list:
+    """Split a figure made of separate views along the blank gutters between them.
+
+    Replaces point-prompted SAM segmentation for this job. Tested on TPM-750
+    Figure 1.1 - views (a) and (b) stacked in one picture - SAM returned view (a)
+    as a 23x17 px fragment and view (b) as a 372x64 strip. Separate views on a
+    manual page are laid out with white space between them, which is a far more
+    reliable boundary for line drawings than a segmentation mask.
+
+    A short band is a caption ("(a) TPM-750-2M two-operator pruner") and is
+    joined to the view above it rather than becoming a "view" of its own.
+    Returns [{"crop", "label", "box"}] - empty when no clean split exists.
+    """
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    ink = gray < 200
+    for axis in (0, 1):            # 0: views stacked top-to-bottom, 1: side by side
+        profile = ink.any(axis=1 - axis)
+        size = len(profile)
+        min_gap = max(8, int(size * VIEW_GAP_RATIO))
+        bands, start, gap = [], None, 0
+        for i, has_ink in enumerate(profile):
+            if has_ink:
+                if start is None:
+                    start = i
+                gap = 0
+            elif start is not None:
+                gap += 1
+                if gap >= min_gap:
+                    bands.append([start, i - gap + 1])
+                    start, gap = None, 0
+        if start is not None:
+            bands.append([start, size])
+
+        merged = []
+        for band in bands:
+            if merged and (band[1] - band[0]) < size * VIEW_CAPTION_RATIO:
+                merged[-1][1] = band[1]           # caption under the view above
+            else:
+                merged.append(band)
+        if merged and len(merged) > 1 and (merged[0][1] - merged[0][0]) < size * VIEW_CAPTION_RATIO:
+            merged[1][0] = merged[0][0]           # a caption above the first view
+            merged.pop(0)
+        if len(merged) < 2:
+            continue
+
+        views = []
+        for n, (a, b) in enumerate(merged, 1):
+            a, b = max(0, a - 6), min(size, b + 6)
+            part = crop[a:b, :] if axis == 0 else crop[:, a:b]
+            box = (0, a, crop.shape[1], b - a) if axis == 0 else (a, 0, b - a, crop.shape[0])
+            views.append({"crop": part, "label": f"View {n} of {len(merged)}", "box": box})
+        return views
+    return []
+
+
+def _overlap(a, b) -> float:
+    """Intersection over the smaller box's area."""
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    smaller = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return (ix * iy) / float(smaller) if smaller > 0 else 0.0
+
+
+def _drawing_code(page, rect) -> str:
+    """The drawing reference printed in the figure's corner, e.g. "TS-2007"."""
+    from services.parts_list import page_words
+    for x0, y0, x1, y1, text, *_ in page_words(page):
+        if fitz.Rect(x0, y0, x1, y1).intersects(rect) and _DRAWING_CODE.match(text):
+            return text.replace("--", "-")
+    return ""
+
 
 class DocumentParser:
     def __init__(self, yolo_weights="models/yolov8_doclaynet.pt"):
@@ -193,16 +381,21 @@ class DocumentParser:
         Processes PDF with Structural Context & Agentic Figure Splitting:
         - Maintains 'current_section' context for every item.
         - Uses YOLOv8 for layout Detection.
-        - Uses FigureSplitter to decompose composite drawings.
+        - Splits a figure into its separate views only along blank gutters (_split_views).
         """
-        from services.figure_splitter import FigureSplitter
-        from services.figure_validator import is_valid_figure
-        splitter = FigureSplitter()
-        
+        from services.figure_validator import classify_figure
+        from services.parts_list import (
+            figure_callouts, match_parts_list, merge_continuation,
+            page_has_text_layer, read_text_layer, read_scanned,
+            page_text as scanned_page_text,
+        )
+
         print(f"📄 [Parser] Opening PDF: {file_path}")
         doc = fitz.open(file_path)
         parsed_data = []
         total_pages = len(doc)
+        figures = []        # every full figure kept, for pairing with parts lists
+        parts_lists = {}    # page -> PartsList read from that page
         
         # In-memory tracking of the document's structural hierarchy
         current_section = "General Information"
@@ -251,6 +444,7 @@ class DocumentParser:
                 #    real answer has. Buffered here and merged into one chunk.
                 seen_text_on_page = set()
                 short_fragments = []
+                figure_boxes_on_page = []
                 for box in boxes:
                     cls_id = int(box.cls[0].item())
                     class_name = names[cls_id].lower()
@@ -267,28 +461,62 @@ class DocumentParser:
                             current_section = txt
                             print(f"      [Structure] New Section Detected: {current_section}")
 
-                    # FIGURES: Use Agentic Splitting
+                    # FIGURES
                     if "picture" in class_name or "figure" in class_name:
-                        # Extract the raw region
-                        raw_crop = img_bgr[int(y1):int(y2), int(x1):int(x2)]
-                        
-                        # Validate BEFORE spending vision calls: the layout model's
-                        # 'Picture' class also catches logos, warning icons, rules and
-                        # dense text blocks, which are useless as retrievable figures.
-                        keep, why = is_valid_figure(raw_crop)
-                        if not keep:
-                            print(f"      🚫 [Validator] Rejected region on page {page_idx}: {why}")
+                        # The layout box routinely clips the edge of a framed
+                        # figure - on the 873 parts manual it cut off callout 28
+                        # (Cab Windows) and callout 30 (Caliper Brake Kit). Grow it
+                        # to the frame, or pad it when there is no frame.
+                        (ex1, ey1, ex2, ey2), grown = _expand_to_frame(
+                            img_bgr, (int(x1), int(y1), int(x2), int(y2))
+                        )
+                        # Several layout boxes inside one frame are one figure.
+                        if any(_overlap((ex1, ey1, ex2, ey2), seen) > 0.8 for seen in figure_boxes_on_page):
+                            continue
+                        figure_boxes_on_page.append((ex1, ey1, ex2, ey2))
+                        rect = fitz.Rect(ex1 * x_scale, ey1 * y_scale, ex2 * x_scale, ey2 * y_scale)
+                        raw_crop = img_bgr[ey1:ey2, ex1:ex2]
+
+                        # Vision alone decides whether this is a figure, and
+                        # whether it may be split. No pixel-size rule drops anything.
+                        if not page_text and not page_has_text_layer(page):
+                            # Scanned page: OCR it once so the figure's title can be
+                            # matched to its parts list and grounds the caption.
+                            page_text = scanned_page_text(page)
+                        verdict = classify_figure(raw_crop, page_text)
+                        if not verdict["keep"]:
+                            print(f"      🚫 [Validator] Not a figure on page {page_idx}: "
+                                  f"{verdict['kind']} - {verdict['reason']}")
                             continue
 
                         parent_ctx = f"Figure on Page {page_idx} under section '{current_section}'"
-                        print(f"      [Figure] Accepted ({why}). Decomposing composite drawing...")
-                        
-                        try:
-                            sub_figures = splitter.split_image_sam(raw_crop, parent_context=parent_ctx)
-                        except Exception as e:
-                            print(f"      ⚠️ [Parser] Figure decomposition crashed: {e}. Using fallback.")
-                            sub_figures = []
-                        
+                        callouts = figure_callouts(page, rect)
+                        drawing_code = _drawing_code(page, rect)
+                        print(f"      [Figure] {verdict['kind']}/{verdict['layout']} ({grown}) - "
+                              f"{len(callouts)} callout numbers in the text layer - {verdict['reason']}")
+
+                        # Only separate views drawn side by side are split. An
+                        # exploded parts view is kept whole: cutting it apart
+                        # separates each callout number from the part it points
+                        # at, which is the whole point of the drawing.
+                        sub_figures = []
+                        if verdict["layout"] == "composite_views":
+                            try:
+                                sub_figures = _split_views(raw_crop)
+                            except Exception as e:
+                                print(f"      ⚠️ [Parser] View split failed: {e}. Keeping whole.")
+                                sub_figures = []
+                            if not sub_figures:
+                                print("      [Figure] No clean gap between views - kept whole.")
+                            if len(sub_figures) > MAX_SPLIT_VIEWS:
+                                # Dozens of "views" means it was really one
+                                # assembly drawing; keep it whole.
+                                print(f"      [Figure] Split produced {len(sub_figures)} pieces - "
+                                      f"that is an assembly, not separate views. Keeping whole.")
+                                sub_figures = []
+                        else:
+                            print(f"      [Figure] Kept whole ({verdict['layout']}).")
+
                         # The whole figure is always stored, even when it splits
                         # cleanly: an explanation should show the full drawing for
                         # orientation before zooming into one component.
@@ -316,24 +544,43 @@ class DocumentParser:
                         )
 
                         if full_url:
-                            parsed_data.append({
+                            figure_chunk = {
                                 "type": "image", "path": full_url, "page": page_idx,
                                 "figure_role": "full", "parent_path": None,
                                 "width": fw, "height": fh,
+                                "kind": verdict["kind"],
                                 "metadata": {
                                     "section": current_section,
                                     "label": "Full Diagram",
                                     "figure_role": "full",
                                     "page_text": page_text,
+                                    "layout": verdict["layout"],
+                                    "callouts": sorted(callouts, key=int),
+                                    "drawing_code": drawing_code,
                                 },
-                            })
+                            }
+                            parsed_data.append(figure_chunk)
+                            figures.append({"chunk": figure_chunk, "page": page_idx,
+                                            "callouts": callouts, "page_text": page_text,
+                                            "layout": verdict["layout"]})
                         else:
                             print(f"      [Parser] Upload unavailable - skipping figure (page {page_idx}).")
 
                         for i, sub in enumerate(sub_figures):
-                            sub_keep, sub_why = is_valid_figure(sub["crop"], use_vision=False)
-                            if not sub_keep:
-                                print(f"         [Validator] Dropped component: {sub_why}")
+                            # Cut the view from the 300 dpi render, not the 150 dpi
+                            # layout image the split was measured on.
+                            bx, by, bw, bh = sub["box"]
+                            sx = full_crop.shape[1] / max(raw_crop.shape[1], 1)
+                            sy = full_crop.shape[0] / max(raw_crop.shape[0], 1)
+                            hi = full_crop[int(by * sy):int((by + bh) * sy), int(bx * sx):int((bx + bw) * sx)]
+                            if hi.size:
+                                sub["crop"] = hi
+                            if sub["crop"] is None or sub["crop"].size == 0:
+                                continue
+                            sub_verdict = classify_figure(sub["crop"], page_text)
+                            if not sub_verdict["keep"]:
+                                print(f"         [Validator] Dropped view: {sub_verdict['kind']} - "
+                                      f"{sub_verdict['reason']}")
                                 continue
 
                             sh, sw = sub["crop"].shape[:2]
@@ -409,8 +656,29 @@ class DocumentParser:
                         txt = b[4].strip()
                         if txt: parsed_data.append({"type": "text", "content": txt, "page": page_idx, "metadata": {"section": current_section}})
 
-            # Step 2: Tables (with context)
-            if camelot:
+            # Step 2a: Parts lists, read from the printed text (see
+            # services/parts_list.py for why not camelot or vision).
+            parts = read_text_layer(page) if page_has_text_layer(page) else None
+            if parts:
+                parts_lists[page_idx] = parts
+                print(f"      [PartsList] {parts.title} {parts.subtitle}: {len(parts.rows)} rows, "
+                      f"{len(parts.refs)} refs (from printed text)")
+                parsed_data.append({
+                    "type": "table", "page": page_idx,
+                    "content": parts.to_text(),
+                    "kind": "table",
+                    "render_markdown": parts.to_markdown(),
+                    "metadata": {
+                        "section": current_section,
+                        "title": " ".join(filter(None, [parts.title, parts.subtitle])) or "Parts list",
+                        "caption": parts.subtitle,
+                        "parts_list": True,
+                        "verified": parts.verified,
+                    },
+                })
+
+            # Step 2b: Other tables (with context)
+            if camelot and not parts:
                 # 'lattice' only finds ruled tables. Plenty of maintenance tables
                 # (torque specs, fault codes) are whitespace-aligned with no borders,
                 # which lattice misses entirely - hence the stream fallback.
@@ -456,7 +724,135 @@ class DocumentParser:
                         seen_tables += 1
                     if seen_tables:
                         break  # lattice results are cleaner; don't duplicate with stream
-            
-        return parsed_data
-            
-        return parsed_data
+
+        # Step 3: give each figure its parts list, now that every page is read.
+        self._attach_parts_lists(doc, figures, parts_lists, parsed_data,
+                                 read_scanned, match_parts_list, merge_continuation,
+                                 page_has_text_layer)
+
+        # Step 4: drop running headers/footers ("Model 873 G-Series / Loader
+        # Parts / 225"). The same short text on many pages says nothing about
+        # any of them, yet as a near-empty chunk it matched unrelated queries -
+        # it came second for a search on a part number in testing.
+        return _drop_page_furniture(parsed_data, doc)
+
+    @staticmethod
+    def _attach_parts_lists(doc, figures, parts_lists, parsed_data,
+                            read_scanned, match_parts_list, merge_continuation,
+                            page_has_text_layer):
+        """Pair every kept figure with the parts list that decodes its callouts,
+        and store one searchable entry per part.
+
+        The list is looked for on the figure's own page first, then the next two
+        pages (a parts manual prints the list after the drawing), then the page
+        before. On a scanned page with no text layer the list is read by vision
+        and flagged unverified.
+        """
+        for fig in figures:
+            page = fig["page"]
+            chunk = fig["chunk"]
+            meta = chunk["metadata"]
+            numbered = bool(fig["callouts"]) or fig["layout"] == "exploded_parts"
+            if not numbered:
+                continue
+
+            window = [p for p in (page, page + 1, page + 2, page - 1) if 1 <= p <= len(doc)]
+            candidates = [parts_lists[p] for p in window if p in parts_lists]
+            if not candidates:
+                for p in window:
+                    if p in parts_lists or page_has_text_layer(doc[p - 1]):
+                        continue
+                    # Scanned page: OCR rows, each checked against a vision read
+                    # (services/parts_list.read_scanned). Only pages next to a
+                    # numbered figure are read, since OCR costs ~25 s a page.
+                    pl = read_scanned(doc[p - 1])
+                    if pl:
+                        parts_lists[p] = pl
+                        candidates.append(pl)
+                        # The scanned list is also stored as a table, with a
+                        # "Reading" column saying how far each row is confirmed.
+                        parsed_data.append({
+                            "type": "table", "page": p,
+                            "content": pl.to_text(),
+                            "kind": "table",
+                            "render_markdown": pl.to_markdown(),
+                            "metadata": {
+                                "title": " ".join(filter(None, [pl.title, pl.subtitle])) or "Parts list",
+                                "caption": pl.subtitle,
+                                "parts_list": True,
+                                "verified": False,
+                            },
+                        })
+
+            match = match_parts_list(fig["page_text"], fig["callouts"], candidates)
+            if not match:
+                print(f"      [PartsList] No parts list found for the figure on page {page}.")
+                continue
+            found, coverage, missing = match
+            following = [parts_lists[p] for p in range(found.page + 1, found.page + 3) if p in parts_lists]
+            plist = merge_continuation(copy.deepcopy(found), following)
+
+            print(f"      [PartsList] Figure p{page} <- list p{plist.pages}: "
+                  f"{len(plist.refs)} refs, callout coverage {coverage:.0%}"
+                  + (f", callouts with no list entry: {missing}" if missing else ""))
+
+            meta["parts_list"] = {
+                "title": plist.title,
+                "subtitle": plist.subtitle,
+                "pages": plist.pages,
+                "verified": plist.verified,
+                "coverage": coverage,
+                "missing_callouts": missing,
+                "groups": [
+                    {"ref": ref, "rows": [vars(r) for r in rows]}
+                    for ref, rows in plist.grouped()
+                ],
+            }
+
+            # One entry per part, each its own vector. A single figure vector
+            # holding 35 parts matches a question about any one of them only
+            # weakly; "part number for the caliper hose" should land on exactly
+            # ref 30, and bring its drawing with it via parent_path.
+            heading = " ".join(filter(None, [plist.title, plist.subtitle])) or "Parts list"
+            code = f" (drawing {meta['drawing_code']})" if meta.get("drawing_code") else ""
+            for ref, rows in plist.grouped():
+                if not ref:
+                    continue
+                first, alts = rows[0], rows[1:]
+                text = (f"{heading} — part ref {ref}: {first.description}, part number "
+                        f"{first.part_number}")
+                if first.qty:
+                    text += f", quantity {first.qty}"
+                if first.remarks:
+                    text += f", {first.remarks}"
+                for a in alts:
+                    text += f". Alternative: {a.description} {a.part_number}"
+                    if a.qty:
+                        text += f", quantity {a.qty}"
+                    if a.remarks:
+                        text += f", {a.remarks}"
+                text += (f". Shown as callout {ref} in the figure on page {page}{code}; "
+                         f"listed on page {plist.page}.")
+                if not plist.verified:
+                    checks = [r.check for r in rows]
+                    if all(c.startswith("confirmed by OCR and vision") for c in checks):
+                        text += " (Scanned page: ref, part number, description and quantity confirmed by two independent readings.)"
+                    else:
+                        text += (" (Scanned page - not fully confirmed: "
+                                 + " | ".join(dict.fromkeys(c for c in checks if not c.startswith("confirmed")))
+                                 + ")")
+                parsed_data.append({
+                    "type": "part",
+                    "content": text,
+                    "page": page,
+                    "path": None,
+                    "parent_path": chunk["path"],
+                    "kind": "part",
+                    "metadata": {
+                        "ref": ref,
+                        "part_numbers": [r.part_number for r in rows if r.part_number],
+                        "parts_list_page": plist.page,
+                        "verified": plist.verified,
+                        "section": meta.get("section"),
+                    },
+                })

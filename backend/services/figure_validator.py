@@ -1,138 +1,111 @@
 """
-Figure validation — reject what isn't actually a diagram.
+Figure validation — vision decides, never pixel counts.
 
-The layout model tags a region 'Picture', but in real manuals that bucket also
-catches headers/footers rendered as graphics, logos, warning icons, decorative
-rules, and dense text blocks. Captioning those wastes a vision call per figure
-and, worse, pollutes retrieval with image chunks that show a technician nothing.
+The layout model tags a region 'Picture', but that bucket also catches logos,
+warning icons, page furniture and text blocks. Whether a region is a figure a
+technician would use is judged by the vision model looking at it.
 
-Two tiers, cheapest first:
-  1. Pixel heuristics (free): size, aspect ratio, ink density, text-likeness.
-  2. A vision check (one call) only for crops the heuristics can't settle.
+Pixel rules (minimum size, ink ratio, aspect ratio, "looks like text") used to
+drop regions here. They threw away real content: on the Cab Windows exploded
+view (873 loader parts manual, p.226) they dropped over 40 pieces of the drawing
+as "too small — icon or glyph", because a parts drawing is made of many small
+line-art parts. Size says nothing about whether a part matters.
+
+The same vision call also says how the figure is laid out, which decides
+whether it may be split at all:
+  - exploded_parts:  one drawing with many numbered parts (a parts-catalogue
+                     page). Always kept whole — cutting it apart separates the
+                     callout numbers from the parts they point at.
+  - composite_views: separate sub-drawings side by side, e.g. "(a) side view"
+                     and "(b) top view". These may be split into their views.
+  - single:          one drawing. Kept whole.
 """
+import base64
+
 import cv2
 import numpy as np
 
 from unified_rag.ai_client import chat_json, MODEL_VISION
 from services.llm_json import loads_tolerant
 
-# An icon or a stray rule is small in absolute terms; real diagrams aren't.
-MIN_AREA_PX = 14_000          # ~120x120
-MIN_SIDE_PX = 60
-MAX_ASPECT = 12.0             # separator rules / text strips
-MIN_INK_RATIO = 0.008         # effectively blank
-MAX_INK_RATIO = 0.97          # a solid filled block, e.g. a colour bar
-
-# Labels that mean "not a figure a technician would use", regardless of what the
-# model puts in is_diagram.
+# Labels that mean "not a figure a technician would use", regardless of what
+# the model puts in is_figure.
 REJECT_KINDS = {"text", "icon", "logo", "decoration", "blank"}
+LAYOUTS = {"single", "exploded_parts", "composite_views"}
+
+# Longest side sent to the vision model. Only for the judgement call — the
+# stored figure keeps its full resolution.
+CLASSIFY_MAX_SIDE = 1400
 
 
-def _ink_mask(crop: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-    _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
-    return binary
-
-
-def _looks_like_text(crop: np.ndarray) -> bool:
-    """Text is many small, similarly-sized blobs sitting on a few baselines;
-    a diagram is a handful of large connected structures."""
-    binary = _ink_mask(crop)
-    h, w = binary.shape[:2]
-    n, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    if n <= 2:
-        return False
-
-    boxes = stats[1:]  # drop background
-    heights = boxes[:, cv2.CC_STAT_HEIGHT]
-    areas = boxes[:, cv2.CC_STAT_AREA]
-
-    glyphs = heights[(heights > 2) & (heights < 0.18 * h)]
-    if len(glyphs) < 12:
-        return False
-
-    # Overwhelmingly small components, none of them structurally large.
-    small_ratio = len(glyphs) / max(len(boxes), 1)
-    largest_share = areas.max() / float(h * w)
-    height_spread = float(np.std(glyphs)) / max(float(np.mean(glyphs)), 1e-6)
-
-    return small_ratio > 0.8 and largest_share < 0.10 and height_spread < 0.6
-
-
-def heuristic_verdict(crop: np.ndarray) -> tuple:
-    """Returns (verdict, reason) where verdict is 'reject' | 'accept' | 'unsure'."""
-    if crop is None or crop.size == 0:
-        return "reject", "empty crop"
-
+def _encode(crop: np.ndarray) -> str:
     h, w = crop.shape[:2]
-    if h < MIN_SIDE_PX or w < MIN_SIDE_PX:
-        return "reject", f"too small ({w}x{h}) — icon or glyph"
-    if h * w < MIN_AREA_PX:
-        return "reject", f"area {h * w}px below diagram threshold"
-
-    aspect = max(w / max(h, 1), h / max(w, 1))
-    if aspect > MAX_ASPECT:
-        return "reject", f"aspect {aspect:.1f}:1 — rule or text strip"
-
-    ink = float(np.count_nonzero(_ink_mask(crop))) / float(h * w)
-    if ink < MIN_INK_RATIO:
-        return "reject", f"ink ratio {ink:.4f} — effectively blank"
-    if ink > MAX_INK_RATIO:
-        return "reject", f"ink ratio {ink:.2f} — solid block"
-
-    if _looks_like_text(crop):
-        return "reject", "component profile matches a text block"
-
-    # Big and structured enough to be obvious; skip the vision call.
-    if h * w > 160_000 and 0.02 < ink < 0.85:
-        return "accept", "large structured region"
-
-    return "unsure", "needs vision check"
+    scale = min(1.0, CLASSIFY_MAX_SIDE / max(h, w))
+    if scale < 1.0:
+        crop = cv2.resize(crop, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".png", crop)
+    return base64.b64encode(buf.tobytes()).decode("utf-8") if ok else ""
 
 
-def _vision_verdict(crop: np.ndarray) -> tuple:
-    import base64
+def classify_figure(crop: np.ndarray, page_text: str = "") -> dict:
+    """{'keep': bool, 'kind': str, 'layout': str, 'reason': str}.
 
-    ok, buf = cv2.imencode(".jpg", crop)
-    if not ok:
-        return True, "encode failed — keeping"
-    b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+    Fails open: if the vision call breaks, the figure is kept whole. Losing a
+    real diagram because the validator crashed is the worst outcome here.
+    """
+    if crop is None or crop.size == 0:
+        # Nothing was cut out — there is no image to judge or store.
+        return {"keep": False, "kind": "blank", "layout": "single", "reason": "empty crop"}
 
+    b64 = _encode(crop)
+    if not b64:
+        return {"keep": True, "kind": "diagram", "layout": "single", "reason": "encode failed — keeping"}
+
+    context = ""
+    if page_text:
+        context = f'\nText printed on the same page (for context): "{" ".join(page_text.split())[:500]}"\n'
     prompt = (
-        "Classify this cropped region from a machine maintenance manual.\n"
+        "Classify this region cut from a machine manual page." + context + "\n"
         "Return JSON with keys:\n"
-        '  "is_diagram": true only if it is a technical illustration, schematic, exploded view, '
-        'photo of equipment, or wiring/flow diagram that would help a technician.\n'
-        '  "kind": one of "diagram", "text", "icon", "logo", "decoration", "blank".\n'
+        '  "is_figure": true if it is a technical illustration a technician would use: a '
+        "diagram, exploded parts view, schematic, wiring/hydraulic/flow diagram, chart, or "
+        "photo of equipment. Small or thin line drawings still count.\n"
+        '  "kind": one of "diagram", "exploded_view", "schematic", "chart", "flowchart", '
+        '"photo", "text", "icon", "logo", "decoration", "blank".\n'
+        '  "layout": one of\n'
+        '     "exploded_parts"  - ONE drawing of an assembly with many parts, usually with '
+        "numbered callouts (a parts-catalogue page), even if the parts are spread apart;\n"
+        '     "composite_views" - two or more SEPARATE drawings of different views, e.g. '
+        "labelled (a) and (b);\n"
+        '     "single"          - one drawing of one thing.\n'
         '  "reason": under 12 words.\n'
-        "Set is_diagram false for plain text/paragraphs/tables, company logos, small warning "
-        "icons, page furniture, borders and blank areas."
+        "is_figure is false only for plain text or paragraphs, company logos, a lone warning "
+        "icon, page borders or blank areas. A rectangular frame drawn around a figure is part "
+        "of the figure."
     )
     try:
-        raw = chat_json(MODEL_VISION, prompt, image_b64=b64, max_tokens=250, temperature=0.0)
-        data = loads_tolerant(raw) if raw else None
-        if isinstance(data, dict) and "is_diagram" in data:
-            kind = str(data.get("kind", "")).strip().lower()
-            keep = bool(data["is_diagram"])
-            # The model routinely answers is_diagram=true while labelling the crop
-            # "icon" or "logo". The specific label is the more reliable signal, so
-            # a rejecting `kind` overrides the boolean.
-            if kind in REJECT_KINDS:
-                keep = False
-            return keep, f"{kind or '?'}: {data.get('reason', '')}"
+        data = loads_tolerant(chat_json(MODEL_VISION, prompt, image_b64=b64,
+                                        max_tokens=250, temperature=0.0) or "")
     except Exception as e:
         print(f"      ⚠️ [Validator] Vision check failed: {e}")
-    # Never drop a figure because the validator itself broke.
-    return True, "validator unavailable — keeping"
+        data = None
+    if not isinstance(data, dict) or "is_figure" not in data:
+        return {"keep": True, "kind": "diagram", "layout": "single",
+                "reason": "vision check unavailable — keeping whole"}
+
+    kind = str(data.get("kind", "")).strip().lower() or "diagram"
+    layout = str(data.get("layout", "")).strip().lower()
+    layout = layout if layout in LAYOUTS else "single"
+    keep = bool(data["is_figure"])
+    # The model sometimes answers is_figure=true while labelling the region
+    # "logo" or "icon"; the specific label is the more reliable signal.
+    if kind in REJECT_KINDS:
+        keep = False
+    return {"keep": keep, "kind": kind, "layout": layout,
+            "reason": str(data.get("reason", "")).strip()[:120]}
 
 
-def is_valid_figure(crop: np.ndarray, use_vision: bool = True) -> tuple:
-    """(keep: bool, reason: str)."""
-    verdict, reason = heuristic_verdict(crop)
-    if verdict == "reject":
-        return False, reason
-    if verdict == "accept":
-        return True, reason
-    if not use_vision:
-        return True, "unsure, vision disabled — keeping"
-    return _vision_verdict(crop)
+def is_valid_figure(crop: np.ndarray, page_text: str = "") -> tuple:
+    """(keep, reason) — vision only. Kept for callers that only need yes/no."""
+    verdict = classify_figure(crop, page_text)
+    return verdict["keep"], f"{verdict['kind']}/{verdict['layout']}: {verdict['reason']}"

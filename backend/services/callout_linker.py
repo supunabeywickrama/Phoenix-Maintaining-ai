@@ -118,7 +118,10 @@ def link_image_chunks(chunks) -> int:
     Those names are what makes the figure findable by part name instead of only
     by the code stamped on it. Returns how many figures were enriched.
     """
-    image_chunks = [c for c in chunks if c.get("type") == "image"]
+    # Figures already named from their own parts list are exact; guessing names
+    # from text snippets could only add a second, worse listing.
+    image_chunks = [c for c in chunks if c.get("type") == "image"
+                    and not (c.get("metadata") or {}).get("parts_resolved")]
     text_chunks = [c for c in chunks if c.get("type") in ("text", "table")]
     if not image_chunks or not text_chunks:
         return 0
