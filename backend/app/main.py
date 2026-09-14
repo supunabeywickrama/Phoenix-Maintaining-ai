@@ -73,6 +73,7 @@ def init_db() -> None:
     def _add_missing_columns() -> None:
         statements = [
             "ALTER TABLE assistant_sessions ADD COLUMN IF NOT EXISTS intent VARCHAR",
+            "ALTER TABLE assistant_sessions ADD COLUMN IF NOT EXISTS resolution TEXT",
             "ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS figure_role VARCHAR",
             "ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS parent_path VARCHAR",
             "ALTER TABLE manual_chunks ADD COLUMN IF NOT EXISTS width INTEGER",

@@ -14,6 +14,19 @@ MIN_IMAGE_RELEVANCE = 1 - 0.62
 # is a strong match, because it is by definition about different equipment.
 MIN_CROSS_MANUAL_RELEVANCE = 1 - 0.45
 
+# Similarity a past fix on the same machine needs before it is shown as "this
+# happened before". Higher than the manual floors on purpose: a manual passage
+# that is loosely related is still useful background, but telling a technician
+# "last time this was the clutch" for an unrelated fault sends them the wrong
+# way. No match shows nothing.
+#
+# Calibrated against a stored "stopped / overheating / injection module" fix
+# (qwen3-embedding:4b): six rewordings of that same fault scored 0.536-0.707,
+# six unrelated questions on the same machine scored 0.232-0.403. 0.47 sits in
+# the gap; 0.55 was tried first and missed "the heater is too hot and the
+# machine tripped" (0.536), a genuine repeat.
+MIN_MEMORY_RELEVANCE = 0.47
+
 # A component crop this small is unreadable on a phone in a plant; SAM
 # sometimes isolates a bolt head or a fragment of a label. It stays in the
 # index (the caption is still searchable) but is not shown in chat.
@@ -54,7 +67,7 @@ def _too_small_to_show(chunk) -> bool:
 
 
 class RetrievalEngine:
-    def __init__(self, top_k_text=3, top_k_image=3, top_k_memory=2, top_k_cross=3,
+    def __init__(self, top_k_text=3, top_k_image=3, top_k_memory=3, top_k_cross=3,
                  top_k_table=2):
         self.top_k_text = top_k_text
         self.top_k_image = top_k_image
@@ -93,15 +106,9 @@ class RetrievalEngine:
         #     when the question was explicitly about torque figures.
         table_results = self._retrieve_tables(query_emb, manual_id)
 
-        # 3. Interaction memory (history), scoped to the machine
-        historical_fixes = []
-        try:
-            if machine_id:
-                historical_fixes = qs.search_interaction_memory(
-                    query_emb, machine_id=machine_id, limit=self.top_k_memory
-                )
-        except Exception as e:
-            print(f"Error retrieving historical fixes: {e}")
+        # 3. Interaction memory (history): same machine only, and only fixes
+        #    that genuinely resemble this report.
+        historical_fixes = self._retrieve_memory(query_emb, machine_id)
 
         # 4. Other manuals: surfaced as clearly attributed pointers, never mixed
         #    silently into this machine's answer.
@@ -116,6 +123,62 @@ class RetrievalEngine:
             "historical_fixes": historical_fixes,
             "cross_manual": cross_refs,
         }
+
+    def _retrieve_memory(self, query_emb, machine_id: str):
+        if not machine_id:
+            return []
+        try:
+            hits = qs.search_interaction_memory(
+                query_emb, machine_id=machine_id, limit=self.top_k_memory
+            )
+        except Exception as e:
+            print(f"Error retrieving historical fixes: {e}")
+            return []
+        return [h for h in hits if (h.relevance or 0.0) >= MIN_MEMORY_RELEVANCE]
+
+    def retrieve_many(self, db, queries: list, manual_id: str, machine_id: str = None,
+                      max_text: int = 8, max_tables: int = 4):
+        """Retrieval for a fault report that names several symptoms at once.
+
+        "Stopped, X part overheating, injection module not working" is three
+        faults to look up, and one embedding of the whole sentence lands near
+        whichever symptom dominates it. Each query is searched separately and
+        the text/table hits are merged, keeping each chunk's best score.
+
+        Images, cross-manual pointers and memory come from the FIRST query (the
+        technician's own words) only, so the relevance gate and the past-fix
+        floor judge against what was actually reported.
+        """
+        queries = [q.strip() for q in queries if q and q.strip()]
+        if not queries:
+            return {"text_chunks": [], "tables": [], "images": [],
+                    "historical_fixes": [], "cross_manual": []}
+
+        base = self.retrieve(db, queries[0], manual_id, machine_id)
+        text_by_id = {c.id: c for c in base["text_chunks"]}
+        table_by_id = {c.id: c for c in base["tables"]}
+
+        def keep_best(bucket: dict, chunk):
+            prev = bucket.get(chunk.id)
+            if prev is None or (chunk.relevance or 0) > (prev.relevance or 0):
+                bucket[chunk.id] = chunk
+
+        for q in queries[1:]:
+            try:
+                emb = embedder.embed_text(q)
+                for c in qs.search_manual_chunks(
+                    emb, manual_id=manual_id, types=["text", "table"], limit=self.top_k_text
+                ):
+                    keep_best(text_by_id, c)
+                for c in self._retrieve_tables(emb, manual_id):
+                    keep_best(table_by_id, c)
+            except Exception as e:
+                print(f"Error retrieving for sub-query '{q[:60]}': {e}")
+
+        by_score = lambda c: -(c.relevance or 0.0)
+        base["text_chunks"] = sorted(text_by_id.values(), key=by_score)[:max_text]
+        base["tables"] = sorted(table_by_id.values(), key=by_score)[:max_tables]
+        return base
 
     def _retrieve_images(self, query_emb, manual_id: str):
         """Figures for the answer, ordered so the full drawing comes before the

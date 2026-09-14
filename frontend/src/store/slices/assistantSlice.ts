@@ -22,11 +22,55 @@ export interface Attachment {
   markdown?: string;
 }
 
+/** How an engineer restored the machine. */
+export type FixMethod = "hands_on" | "system_guided" | "both";
+
+/** A confirmed fix from earlier on the same machine, straight from the database. */
+export interface PastIncident {
+  date: string | null;
+  engineer: string | null;
+  symptom: string | null;
+  root_cause: string | null;
+  actions: string | null;
+  method: FixMethod | null;
+  parts_replaced: string | null;
+  summary: string | null;
+  session_id: number | null;
+  similarity: number | null;
+}
+
+/** A question the assistant asked, with answers the technician can tap. */
+export interface PendingQuestion {
+  question: string;
+  options: string[];
+}
+
+/** Structured extras saved with an agent message. */
+export interface StepData {
+  past_incidents?: PastIncident[];
+  questions?: PendingQuestion[];
+}
+
+export interface FixRecord {
+  engineer: string;
+  root_cause: string;
+  actions: string;
+  method: FixMethod;
+  parts_replaced?: string;
+}
+
+export interface FixDraft {
+  root_cause: string;
+  actions: string;
+  parts_replaced: string;
+}
+
 export interface ChatMessage {
   role: "user" | "agent";
   content: string;
   images: string[];
   attachments?: Attachment[];
+  step_data?: StepData | null;
   timestamp: string;
   type?: string;
   /** Set locally when a request fails, so the UI can style it as an error. */
@@ -51,6 +95,7 @@ export interface MaintenanceReport {
   solutionSteps: string[];
   images: { url: string; caption: string }[];
   resolvedAt: string | null;
+  resolution?: (FixRecord & { symptom?: string | null; summary?: string; resolved_at?: string }) | null;
   timestamp: string;
 }
 
@@ -89,6 +134,8 @@ interface AskResponse {
   manual_id: string | null;
   images: string[];
   attachments: Attachment[];
+  past_incidents?: PastIncident[];
+  questions?: PendingQuestion[];
   mode: AskMode;
   intent: ChatIntent | null;
   context_source: string;
@@ -178,18 +225,29 @@ export const deleteSession = createAsyncThunk(
   }
 );
 
-/** Files what actually fixed the machine so future questions surface it. */
+/** Files what actually fixed the machine so future reports of the same fault
+ *  on this machine show it first. */
 export const resolveSession = createAsyncThunk(
   "assistant/resolve",
-  async ({ sessionId, operatorFix }: { sessionId: number; operatorFix: string }) =>
-    apiFetch<{ status: string; summary: string }>(
+  async ({ sessionId, fix }: { sessionId: number; fix: FixRecord }) =>
+    apiFetch<{ status: string; summary: string; resolution: FixRecord }>(
       `/api/assistant/sessions/${sessionId}/resolve`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ operator_fix: operatorFix }),
+        body: JSON.stringify(fix),
       }
     )
+);
+
+/** A draft of the fix record from the conversation, for the engineer to correct.
+ *  Never includes the engineer's name or the method — only they know those. */
+export const fetchResolveDraft = createAsyncThunk(
+  "assistant/resolveDraft",
+  async (sessionId: number) =>
+    apiFetch<FixDraft>(`/api/assistant/sessions/${sessionId}/resolve-draft`, {
+      method: "POST",
+    })
 );
 
 export const fetchReport = createAsyncThunk(
@@ -248,6 +306,12 @@ const assistantSlice = createSlice({
           content: action.payload.content,
           images: action.payload.images || [],
           attachments: action.payload.attachments || [],
+          // Same shape session history returns, so a live reply and a reopened
+          // chat render through one path.
+          step_data: {
+            past_incidents: action.payload.past_incidents || [],
+            questions: action.payload.questions || [],
+          },
           timestamp: action.payload.timestamp,
           type: action.payload.mode === "wizard" ? "wizard_step" : "text",
         });
@@ -327,11 +391,11 @@ const assistantSlice = createSlice({
       })
       .addCase(resolveSession.fulfilled, (state, action) => {
         state.isResolving = false;
-        const session = state.sessions.find((s) => s.id === state.activeSessionId);
+        const session = state.sessions.find((s) => s.id === action.meta.arg.sessionId);
         if (session) session.resolved = true;
         state.messages.push({
           role: "agent",
-          content: `**Fix recorded.** Future questions about this machine will surface it.\n\n${action.payload.summary}`,
+          content: `**Fix recorded.** The next time this fault is reported on this machine, this fix is shown first.\n\n${action.payload.summary}`,
           images: [],
           timestamp: new Date().toISOString(),
         });

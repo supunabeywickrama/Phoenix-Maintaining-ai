@@ -1,18 +1,81 @@
+import re
 from enum import Enum
 from unified_rag.retrieval.retriever import RetrievalEngine
 from unified_rag.db.database import SessionLocal
-from unified_rag.ai_client import get_client, chat_text, MODEL_CHAT
+from unified_rag.ai_client import get_client, chat_text, chat_json, MODEL_CHAT, MODEL_CHAT_LIGHT
 from services.image_relevance import verify_images
+from services.llm_json import loads_tolerant
 from services.table_validator import markdown_is_usable
 
 class RAGMode(Enum):
     SUMMARY = "summary"
+    DIAGNOSIS = "diagnosis"
     PROCEDURE = "procedure"
     CLARIFICATION = "clarification"
     EVALUATION = "evaluation"
     CONVERSATIONAL_WIZARD = "conversational_wizard"
     LEARNING = "learning"
     LEARNING_WALKTHROUGH = "learning_walkthrough"
+
+
+# A "### Happened before..." markdown section, up to the next heading or the end.
+_PAST_SECTION = re.compile(
+    r"^#{1,4}\s*Happened before[^\n]*\n.*?(?=^#{1,4}\s|\Z)",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
+
+# "[IMAGE_0] DIAGRAM, FULL VIEW - title (page N)" / "[TABLE_1] TABLE - title (page N)":
+# the exact shape of an AVAILABLE MATERIAL line, echoed into the answer.
+_TAG_LISTING_LEAK = re.compile(
+    r"(\[(?:IMAGE|TABLE)_\d+\])[ \t]+(?:DIAGRAM|SCHEMATIC|CHART|FLOWCHART|EXPLODED VIEW|PHOTO|TABLE)\b"
+    r"[^\n]*\(page[^\n]*"
+)
+
+METHOD_LABELS = {
+    "hands_on": "by hand (engineer's own experience)",
+    "system_guided": "by following the system's instructions",
+    "both": "by hand and the system's instructions",
+}
+
+
+def _diagnosis_queries(report: str) -> list:
+    """Split a fault report into separate lookups.
+
+    "Stopped, X part overheating, injection module not working" names three
+    symptoms; searched as one sentence it only finds whichever dominates. One
+    cheap light-model call pulls them apart. On any failure the report alone is
+    searched, which is exactly the previous behaviour.
+    """
+    queries = [report]
+    prompt = (
+        "A technician reported a machine fault. Extract what to look up in the machine's "
+        "manual. Return JSON with keys:\n"
+        '  "symptoms": short phrases, one per distinct symptom (max 4)\n'
+        '  "components": parts or systems named (max 4)\n'
+        '  "fault_codes": any codes or alarm numbers mentioned\n'
+        "Use the technician's own words, corrected for spelling. Do not add symptoms "
+        f"that were not reported.\n\nREPORT: {report}"
+    )
+    try:
+        data = loads_tolerant(chat_json(MODEL_CHAT_LIGHT, prompt, max_tokens=300, temperature=0.0) or "")
+    except Exception as e:
+        print(f"Symptom extraction skipped: {e}")
+        return queries
+    if not isinstance(data, dict):
+        return queries
+
+    def items(key, n):
+        return [str(x).strip() for x in (data.get(key) or []) if str(x).strip()][:n]
+
+    queries += [f"{s} cause troubleshooting" for s in items("symptoms", 4)]
+    queries += items("components", 4)
+    queries += [f"fault code {c}" for c in items("fault_codes", 3)]
+    seen, out = set(), []
+    for q in queries:
+        if q.lower() not in seen:
+            seen.add(q.lower())
+            out.append(q)
+    return out
 
 def _title_of(chunk, fallback: str) -> str:
     """First line of a caption doubles as its title - the captioner writes
@@ -66,7 +129,14 @@ class RAGGenerator:
             # STAGE 1: SEMANTIC RETRIEVAL (Fault Tolerant)
             try:
                 db = SessionLocal()
-                retrieved_data = self.retriever.retrieve(db, search_query, manual_id, machine_id)
+                if mode == RAGMode.DIAGNOSIS:
+                    # A diagnosis has to consider every cause the manual gives
+                    # for every symptom reported, not just the nearest passage.
+                    retrieved_data = self.retriever.retrieve_many(
+                        db, _diagnosis_queries(search_query), manual_id, machine_id
+                    )
+                else:
+                    retrieved_data = self.retriever.retrieve(db, search_query, manual_id, machine_id)
             except Exception as e:
                 print(f"RAG_DB_ERROR: {e}. Falling back to manual-only context.")
             finally:
@@ -146,9 +216,23 @@ class RAGGenerator:
                 if t.page is not None:
                     pages.add(t.page)
 
+            # Past fixes on this same machine that cleared the retriever's
+            # similarity floor. Handed back as structured records too, so the
+            # chat can show them from the database rather than as model prose.
             history_context = ""
+            past_incidents = []
             for i, fix in enumerate(retrieved_data.get("historical_fixes", [])):
-                history_context += f"--- PREVIOUS FIX {i+1} ({fix.timestamp}) ---\nSummary: {fix.summary}\nOperator Actions: {fix.operator_fix}\n\n"
+                history_context += (
+                    f"--- PREVIOUS INCIDENT {i+1} on this machine ({fix.timestamp}) ---\n"
+                    f"Reported: {fix.symptom or 'not recorded'}\n"
+                    f"Root cause found: {fix.root_cause or 'not recorded'}\n"
+                    f"What fixed it: {fix.actions or fix.operator_fix or 'not recorded'}\n"
+                    f"Method: {METHOD_LABELS.get(fix.method or '', 'not recorded')}\n"
+                    f"Parts replaced: {fix.parts_replaced or 'none recorded'}\n"
+                    f"Engineer: {fix.engineer or 'not recorded'}\n"
+                    f"Summary: {fix.summary or ''}\n\n"
+                )
+                past_incidents.append(fix.as_dict())
 
             # Attachments are what the reader actually sees, in the order they
             # should meet them: the whole drawing for orientation, then the parts
@@ -196,7 +280,11 @@ class RAGGenerator:
                 table_index += 1
                 
             # STAGE 3: MODE SELECTION (Prompt Construction)
-            if mode == RAGMode.PROCEDURE:
+            if mode == RAGMode.DIAGNOSIS:
+                system_prompt = self._build_diagnosis_prompt(
+                    manual_id, text_context, history_context, chat_history, manual_missing
+                )
+            elif mode == RAGMode.PROCEDURE:
                 system_prompt = self._build_procedure_prompt(manual_id, text_context, history_context, image_references)
             elif mode == RAGMode.CLARIFICATION:
                 system_prompt = self._build_clarification_prompt(manual_id, query, text_context, image_references, manual_missing)
@@ -249,7 +337,8 @@ class RAGGenerator:
                     "4. Do NOT retype a table's contents as prose - place the tag and comment on "
                     "what it shows.\n"
                     "5. Place every tag on its own line at the point where the reader should look "
-                    "at it. Never dump tags at the end.\n"
+                    "at it. Never dump tags at the end. Write ONLY the bare tag, e.g. [IMAGE_0] - "
+                    "never copy the description text from the list above next to it.\n"
                     "6. Use each tag EXACTLY ONCE. Referring to the same table three times "
                     "renders it three times; refer back to it in words instead.\n"
                     "7. Name the material in the sentence that introduces it, e.g. 'the wiring "
@@ -289,6 +378,8 @@ class RAGGenerator:
                     user_content = f"Explain this so I understand how it works: '{query}'"
                 elif mode == RAGMode.LEARNING_WALKTHROUGH:
                     user_content = f"Teach me this one part at a time: '{query}'"
+                elif mode == RAGMode.DIAGNOSIS:
+                    user_content = f"Fault report from the technician: '{query}'"
                 else:
                     user_content = f"Technician query: '{query}'"
                 
@@ -299,13 +390,27 @@ class RAGGenerator:
             except Exception as e:
                 print(f"LLM API call failed: {e}")
                 answer = "Error generating response from LLM."
-            
+
+            # Hard guard, independent of the prompt: with no confirmed fix on
+            # record, any "happened before" section is invented history and is
+            # removed. The past-fix card the chat shows comes from the database
+            # rows, so this section is never the only place a real one appears.
+            if not past_incidents and answer:
+                answer = _PAST_SECTION.sub("", answer)
+            # The model sometimes copies a whole AVAILABLE MATERIAL listing line
+            # ("[IMAGE_0] DIAGRAM, FULL VIEW - Service Decal ... (page 23)")
+            # instead of just the tag; the UI swaps the tag for the figure and
+            # would leave the rest as stray text beside it.
+            if answer:
+                answer = _TAG_LISTING_LEAK.sub(r"\1", answer)
+
             return {
                 "answer": answer,
                 "images": image_references,
                 "attachments": attachments,
                 "pages": sorted(list(pages)),
                 "cross_manual": cross_refs,
+                "past_incidents": past_incidents,
             }
         except Exception as e:
             print(f"RAG formulation failed: {e}")
@@ -317,6 +422,89 @@ class RAGGenerator:
             "YOU MUST START YOUR RESPONSE WITH THIS EXACT DISCLAIMER: "
             "'⚠️ Documentation Alert: I do not have the specific technical manual for this machine in my database. "
             "The following steps are based on general industrial best practices. Please consult local site safety protocols before proceeding.'\n\n"
+        )
+
+    def _build_diagnosis_prompt(self, manual_id: str, text_context: str, history_context: str,
+                                history: str = "", missing_manual: bool = False) -> str:
+        """First reply to a fault report: make it safe, say what is probably
+        wrong, and give the checks in the order to do them — then ask for the
+        result of the first check so the fix can be steered by evidence.
+
+        Replaces SUMMARY for fault reports: a technician standing at a stopped
+        machine needs to know what to check, and SUMMARY forbade saying.
+        """
+        disclaimer = self._get_disclaimer() if missing_manual else ""
+        # The past-incident section is only described to the model when there
+        # are incidents. Telling it "leave this out if there are none" was not
+        # enough: with nothing on record it still wrote the heading and filled
+        # it with a made-up history. What it is never told about, it can't write.
+        if history_context:
+            past = (
+                "PAST INCIDENTS ON THIS SAME MACHINE (confirmed fixes from the maintenance "
+                f"database):\n{history_context}"
+            )
+            past_section = (
+                "### Happened before on this machine\n"
+                "One short paragraph per past incident listed above - when, what the cause was, "
+                "what fixed it, and how (by hand or following the system's instructions). Say "
+                "whether it matches this report closely or only partly. Use only what the record "
+                "says.\n\n"
+            )
+        else:
+            past, past_section = "", ""
+        return (
+            f"""You are a senior maintenance engineer diagnosing a fault on: {manual_id}.
+
+{disclaimer}CONVERSATION SO FAR:
+{history or '(this is the first message)'}
+
+{past}
+MANUAL SOURCE OF TRUTH:
+{text_context}
+
+WRITE YOUR REPLY IN EXACTLY THIS STRUCTURE (markdown):
+
+[PHASE: Diagnosis]
+
+### Safety first
+- 2-4 bullets on making the machine safe to inspect for THESE symptoms: how to stop and
+  isolate it, and the hazards this particular fault creates. Safety bullets are about
+  making it safe, not about troubleshooting. Only hazards the manual states for this
+  machine, or that the reported symptoms directly create (an overheating engine means hot
+  surfaces). Do NOT list a hazard just because machines commonly have it - if the manual
+  context says nothing about stored pressure or electrics on this machine, do not mention
+  them. Cite (page N) where the manual states it.
+
+{past_section}### What is likely happening
+A numbered list of probable causes, most likely first. For each: **the cause** - why it
+fits what the technician reported - (page N). Consider every symptom reported, and causes
+that connect them (e.g. one failure that explains both the overheating and the stop).
+If a past incident on this machine matches, weigh that cause higher and say so.
+
+### Check in this order
+A numbered list of 3-5 checks that between them cover the likely causes above - safest
+and quickest first, then most likely cause. For each:
+**Check:** what part or reading to look at
+**How:** exactly how - tool, location, spec or limit from the manual - (page N)
+**Result → meaning:** what each result tells you, pointing to a cause number above or to
+the next check (e.g. "Below 0.75 MPa → cause 2 · Normal → go to check 3").
+
+Then end with EXACTLY ONE question on its own line, for the result of the FIRST check, in
+this format, with 2-4 short answers the technician can tap:
+[ASK: <question> | <answer> | <answer> | <answer>]
+The answers are what the technician OBSERVES ("Yes, fins blocked", "No, fins clear",
+"Below 0.75 MPa"), never instructions ("clean the fins") - you decide what to do next
+from their answer.
+
+RULES:
+- Use ONLY values, limits, part names and procedures that appear in the manual context or
+  the past incidents. If the manual does not give a spec, say "the manual does not give a
+  value for this" - never invent one.
+- Do not write the repair procedure yet. That comes after the technician reports what the
+  checks show.
+- Do not emit any [SUGGESTION: ...] tag.
+- Do not narrate your reasoning; write the answer directly.
+"""
         )
 
     def _build_summary_prompt(self, manual_id: str, text_context: str, history_context: str, missing_manual: bool = False) -> str:
@@ -495,7 +683,28 @@ MANUAL SOURCE OF TRUTH:
             "6. RESPONSE STYLE: Professional, highly structured, and technical. Use bolding for emphasis.\n\n"
             "7. CITE PAGES: when a step comes from the manual, cite it as (page N) using the "
             "page numbers in the context above, so the technician can check the original.\n"
-            "OUTPUT FORMAT: Start with '[PHASE: <Name>]'.\n\n"
+            "8. USE THE CHECK RESULTS: if the history contains a diagnosis and the technician has "
+            "reported what a check showed, start by saying in one or two sentences which cause "
+            "that result now points to and why. If it rules a cause out, say so and move to the "
+            "next check instead of repairing the wrong thing.\n"
+            "9. EXPLAIN EVERY STEP: give 1-2 steps per reply, never the whole repair at once. "
+            "Write each step as:\n"
+            "   **Step N - <short title>**\n"
+            "   - **Do:** the exact action\n"
+            "   - **Why:** what this achieves / what it rules in or out\n"
+            "   - **How:** tool, location, torque/spec/limit from the manual (page N)\n"
+            "   - **You should see:** the result that means the step worked\n"
+            "10. ASK AT THE END: finish with EXACTLY ONE question on its own line in this format:\n"
+            "   [ASK: <question> | <answer> | <answer> | <answer>]\n"
+            "   When you need a reading or observation, ask for it with realistic answer options. "
+            "After a step that should clear the fault, ask: "
+            "[ASK: Did that fix it? | Problem solved | Done - still faulty | I'm stuck]\n"
+            "11. Never invent a value, limit or part number that is not in the manual context. "
+            "Do not narrate your reasoning.\n"
+            "OUTPUT FORMAT: Start with '[PHASE: <Name>]' where Name is Safety, Repair or "
+            "Verification - the diagnosis is already done, so never 'Diagnosis'.\n\n"
             "SAFETY MANDATE:\n"
-            "- IF CHAT HISTORY IS EMPTY: You MUST exclusively provide Safety and Preparation steps (PPE, LOTO, etc.) as the very first instruction. DO NOT skip to the actual repair task.\n"
+            "- If the CHAT HISTORY already contains a 'Safety first' section, do NOT repeat it: "
+            "open with one line confirming the machine is still stopped and isolated, then continue.\n"
+            "- Otherwise, IF CHAT HISTORY IS EMPTY OR HAS NO SAFETY STEPS: You MUST exclusively provide Safety and Preparation steps (PPE, LOTO, etc.) as the very first instruction. DO NOT skip to the actual repair task.\n"
         )

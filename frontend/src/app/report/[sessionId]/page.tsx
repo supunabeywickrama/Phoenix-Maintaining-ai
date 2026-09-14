@@ -150,6 +150,36 @@ export default function ReportPage() {
           </p>
         )}
 
+        {report.resolution && (
+          <section className="mt-6 rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-4">
+            <h2 className="text-[11px] font-black uppercase tracking-widest text-emerald-400">
+              Fix record
+            </h2>
+            <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-[10rem_1fr]">
+              <dt className="font-bold text-slate-500">Engineer</dt>
+              <dd className="text-slate-200">{report.resolution.engineer || "Not recorded"}</dd>
+              <dt className="font-bold text-slate-500">Method</dt>
+              <dd className="text-slate-200">
+                {{
+                  hands_on: "By hand (engineer's own experience)",
+                  system_guided: "Followed the system's instructions",
+                  both: "By hand and the system's instructions",
+                }[report.resolution.method] ?? "Not recorded"}
+              </dd>
+              <dt className="font-bold text-slate-500">Actual cause</dt>
+              <dd className="text-slate-200">{report.resolution.root_cause || "Not recorded"}</dd>
+              <dt className="font-bold text-slate-500">What was done</dt>
+              <dd className="whitespace-pre-line text-slate-200">{report.resolution.actions}</dd>
+              {report.resolution.parts_replaced && (
+                <>
+                  <dt className="font-bold text-slate-500">Parts replaced</dt>
+                  <dd className="text-slate-200">{report.resolution.parts_replaced}</dd>
+                </>
+              )}
+            </dl>
+          </section>
+        )}
+
         <section className="mt-6">
           <h2 className="text-[11px] font-black uppercase tracking-widest text-orange-400">Problem</h2>
           <p className="mt-2 text-sm leading-relaxed text-slate-300">{report.problemDescription}</p>

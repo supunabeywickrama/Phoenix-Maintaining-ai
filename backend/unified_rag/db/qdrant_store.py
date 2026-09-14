@@ -81,6 +81,16 @@ def ensure_collections() -> None:
             INTERACTION_MEMORY, field_name="machine_id", field_schema=qm.PayloadSchemaType.KEYWORD
         )
 
+    # Added after the collection first shipped, so applied to existing
+    # collections too. Creating an index that already exists is a no-op
+    # server-side; the except only covers servers that reject the repeat.
+    try:
+        client.create_payload_index(
+            INTERACTION_MEMORY, field_name="session_id", field_schema=qm.PayloadSchemaType.INTEGER
+        )
+    except Exception:
+        pass
+
 
 class ChunkResult:
     """One manual_chunks point. `relevance` is set by callers after search
@@ -106,18 +116,43 @@ class ChunkResult:
         self.relevance = score
 
 
-class MemoryResult:
-    """One interaction_memory point."""
-    __slots__ = ("id", "machine_id", "manual_id", "summary", "operator_fix", "timestamp")
+MEMORY_FIELDS = (
+    "machine_id", "manual_id", "session_id", "symptom", "root_cause", "actions",
+    "method", "parts_replaced", "engineer", "summary", "operator_fix", "timestamp",
+)
 
-    def __init__(self, id, payload: dict):
+
+class MemoryResult:
+    """One interaction_memory point: a fix an engineer confirmed on a machine.
+
+    Points written before structured fix records existed only carry
+    `summary`/`operator_fix`; the newer fields simply come back as None.
+    """
+    __slots__ = ("id", "relevance") + MEMORY_FIELDS
+
+    def __init__(self, id, payload: dict, score: Optional[float] = None):
         p = payload or {}
         self.id = id
-        self.machine_id = p.get("machine_id")
-        self.manual_id = p.get("manual_id")
-        self.summary = p.get("summary")
-        self.operator_fix = p.get("operator_fix")
-        self.timestamp = p.get("timestamp")
+        self.relevance = score
+        for field in MEMORY_FIELDS:
+            setattr(self, field, p.get(field))
+
+    def as_dict(self) -> dict:
+        """The shape the API returns and the chat's past-fix card renders."""
+        return {
+            "date": self.timestamp,
+            "engineer": self.engineer,
+            "symptom": self.symptom,
+            "root_cause": self.root_cause,
+            # Old points have no structured actions; their free-text fix is the
+            # closest thing to "what was done".
+            "actions": self.actions or self.operator_fix,
+            "method": self.method,
+            "parts_replaced": self.parts_replaced,
+            "summary": self.summary,
+            "session_id": self.session_id,
+            "similarity": round(self.relevance, 3) if self.relevance is not None else None,
+        }
 
 
 def _chunk_payload(**fields) -> dict:
@@ -175,13 +210,7 @@ def upsert_manual_chunks(items: list) -> int:
 
 def upsert_interaction_memory(vector: list, point_id=None, **fields) -> str:
     pid = point_id if point_id is not None else str(uuid.uuid4())
-    payload = {
-        "machine_id": fields.get("machine_id"),
-        "manual_id": fields.get("manual_id"),
-        "summary": fields.get("summary"),
-        "operator_fix": fields.get("operator_fix"),
-        "timestamp": fields.get("timestamp"),
-    }
+    payload = {field: fields.get(field) for field in MEMORY_FIELDS}
     get_client().upsert(
         collection_name=INTERACTION_MEMORY,
         points=[qm.PointStruct(id=pid, vector=vector, payload=payload)],
@@ -283,7 +312,28 @@ def search_interaction_memory(vector: list, machine_id: str, limit: int = 2) -> 
         limit=limit,
         with_payload=True,
     )
-    return [MemoryResult(h.id, h.payload) for h in resp.points]
+    # The score is kept: callers need it to tell a genuine repeat of the same
+    # fault from the least-unrelated fix that happens to be on file.
+    return [MemoryResult(h.id, h.payload, h.score) for h in resp.points]
+
+
+def delete_interaction_memory_for_session(session_id: int) -> None:
+    """Remove the fix(es) filed from one chat session. Deleting a session whose
+    recorded fix was wrong is how that fix stops being recalled."""
+    get_client().delete(
+        collection_name=INTERACTION_MEMORY,
+        points_selector=qm.FilterSelector(filter=qm.Filter(must=[
+            qm.FieldCondition(key="session_id", match=qm.MatchValue(value=session_id))
+        ])),
+    )
+
+
+def count_interaction_memory() -> int:
+    try:
+        return get_client().count(collection_name=INTERACTION_MEMORY, exact=True).count
+    except Exception as e:
+        print(f"[qdrant_store] count_interaction_memory unavailable: {e}")
+        return 0
 
 
 def count_manual_chunks(manual_id: str) -> int:

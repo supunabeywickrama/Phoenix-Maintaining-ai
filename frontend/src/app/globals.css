@@ -5,6 +5,36 @@
   --color-phoenix-400: #fb923c;
   --color-phoenix-500: #f97316;
   --color-phoenix-600: #ea580c;
+
+  /* "Problem solved" button and fix-record dialog. Always applied through
+     motion-safe:, so reduced-motion users get the static states. */
+  --animate-solved-glow: solved-glow 2.6s ease-in-out infinite;
+  --animate-solved-pop: solved-pop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  --animate-dialog-in: dialog-in 0.22s ease-out both;
+  --animate-shimmer: shimmer 1.4s linear infinite;
+
+  @keyframes solved-glow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+    50% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0.18); }
+  }
+  @keyframes solved-pop {
+    0% { transform: scale(0.4); opacity: 0; }
+    100% { transform: scale(1); opacity: 1; }
+  }
+  @keyframes dialog-in {
+    0% { transform: translateY(8px) scale(0.98); opacity: 0; }
+    100% { transform: translateY(0) scale(1); opacity: 1; }
+  }
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+}
+
+/* Placeholder bar shown while the fix draft loads. */
+.draft-shimmer {
+  background: linear-gradient(90deg, #1e293b 25%, #334155 50%, #1e293b 75%);
+  background-size: 200% 100%;
 }
 
 :root {

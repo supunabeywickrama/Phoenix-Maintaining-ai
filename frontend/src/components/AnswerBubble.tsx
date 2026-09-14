@@ -15,6 +15,7 @@ import {
   Layers,
 } from "lucide-react";
 import type { Attachment, ChatMessage } from "../store/slices/assistantSlice";
+import PastIncidentCard from "./PastIncidentCard";
 
 /** `[IMAGE_0]`, `[TABLE_1]` … emitted inline by the retrieval prompts. */
 const ASSET_TAG = /\[(IMAGE|TABLE)_(\d+)\]/g;
@@ -22,6 +23,9 @@ const ASSET_TAG = /\[(IMAGE|TABLE)_(\d+)\]/g;
 const PHASE_TAG = /^\s*\[PHASE:\s*([^\]]+)\]\s*/i;
 /** Summary mode ends with a tag used to offer the step-by-step follow-up. */
 const SUGGESTION_TAG = /\[SUGGESTION:[^\]]*\]/gi;
+/** Questions are lifted out server-side and shown as tappable answers; this
+ *  only guards against a stray tag in older or malformed replies. */
+const ASK_TAG = /\[ASK:[^\]]*\]/gi;
 
 type Segment =
   | { kind: "text"; value: string }
@@ -182,7 +186,7 @@ export default function AnswerBubble({ message }: { message: ChatMessage }) {
     if (message.role === "user") {
       return { phase: null, segments: [{ kind: "text", value: message.content }] as Segment[] };
     }
-    let body = message.content.replace(SUGGESTION_TAG, "").trim();
+    let body = message.content.replace(SUGGESTION_TAG, "").replace(ASK_TAG, "").trim();
     const phaseMatch = body.match(PHASE_TAG);
     if (phaseMatch) body = body.replace(PHASE_TAG, "");
     return {
@@ -240,6 +244,12 @@ export default function AnswerBubble({ message }: { message: ChatMessage }) {
             : "border-slate-800 bg-slate-900 text-slate-200"
         }`}
       >
+        {/* Confirmed fixes from this machine's history lead the answer, so the
+            technician sees what worked last time before the new suggestions. */}
+        {!!message.step_data?.past_incidents?.length && (
+          <PastIncidentCard incidents={message.step_data.past_incidents} />
+        )}
+
         {phase && (
           <div className="mb-2 inline-block rounded-full border border-orange-500/30 bg-orange-500/10 px-2.5 py-0.5 text-[10px] font-black uppercase tracking-wider text-orange-400">
             {phase}

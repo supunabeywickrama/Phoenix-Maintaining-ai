@@ -7,7 +7,6 @@ import {
   askAssistant,
   askAssistantWithImage,
   fetchSessions,
-  resolveSession,
   setIntent,
   AskMode,
   ChatIntent,
@@ -17,11 +16,13 @@ import MachineSelector from "../components/MachineSelector";
 import SessionSidebar from "../components/SessionSidebar";
 import AnswerBubble from "../components/AnswerBubble";
 import StepCard from "../components/StepCard";
+import QuickReplyCard from "../components/QuickReplyCard";
+import ProblemSolvedButton from "../components/ProblemSolvedButton";
+import ResolveFixModal from "../components/ResolveFixModal";
 import {
   Send,
   Loader2,
   Flame,
-  ClipboardCheck,
   FileDown,
   GraduationCap,
   Paperclip,
@@ -49,17 +50,18 @@ export default function AskPage() {
     activeSessionId,
     selectedMachineId,
     contextSource,
-    isResolving,
     intent,
+    sessions,
   } = useSelector((s: RootState) => s.assistant);
+  const machines = useSelector((s: RootState) => s.machines.items);
 
   const [input, setInput] = useState("");
-  const [fixText, setFixText] = useState("");
   const [showResolve, setShowResolve] = useState(false);
   const [attachedImage, setAttachedImage] = useState<File | null>(null);
   const [attachedPreview, setAttachedPreview] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -102,15 +104,33 @@ export default function AskPage() {
     return -1;
   })();
   const inWizard = lastAgentIndex >= 0 && messages[lastAgentIndex].type === "wizard_step";
+  const pendingQuestions =
+    lastAgentIndex >= 0 ? messages[lastAgentIndex].step_data?.questions ?? [] : [];
 
-  const submitFix = () => {
-    if (!activeSessionId || !fixText.trim()) return;
-    dispatch(resolveSession({ sessionId: activeSessionId, operatorFix: fixText.trim() })).then(
-      () => {
-        setFixText("");
-        setShowResolve(false);
-      }
-    );
+  // A fix can only be filed against a machine, and only once there is a fault
+  // conversation to close out.
+  const activeSession = sessions.find((s) => s.id === activeSessionId);
+  const sessionMachineId = activeSession?.machine_id ?? selectedMachineId;
+  const machine = machines.find((m) => m.machine_id === sessionMachineId);
+  const machineLabel = machine ? `${machine.name} (${machine.machine_id})` : sessionMachineId ?? "this machine";
+  const canRecordFix =
+    Boolean(activeSessionId && sessionMachineId) && intent !== "learn" && lastAgentIndex >= 0;
+
+  const answerOther = (prefill: string) => {
+    setInput(prefill);
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(prefill.length, prefill.length);
+    });
+  };
+
+  const openResolve = () => {
+    if (canRecordFix) setShowResolve(true);
+    // No machine on this chat, so there is nowhere to file the fix — just tell
+    // the assistant, which still closes the conversation out sensibly.
+    else send("Problem solved — the machine is running again.", "wizard");
   };
 
   return (
@@ -149,42 +169,24 @@ export default function AskPage() {
                 >
                   <FileDown size={14} /> Report
                 </a>
-                <button
-                  onClick={() => setShowResolve((v) => !v)}
-                  className="flex items-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs font-bold text-emerald-400 hover:bg-emerald-500/20"
-                >
-                  <ClipboardCheck size={14} /> Record fix
-                </button>
+                {canRecordFix && (
+                  <ProblemSolvedButton
+                    resolved={Boolean(activeSession?.resolved)}
+                    active={inWizard}
+                    onClick={openResolve}
+                  />
+                )}
               </>
             )}
           </div>
         </header>
 
         {showResolve && activeSessionId && (
-          <div className="border-b border-slate-800 bg-emerald-500/5 p-4">
-            <label className="mb-2 block text-xs font-bold uppercase tracking-wider text-emerald-400">
-              What actually fixed it?
-            </label>
-            <p className="mb-2 text-xs text-slate-400">
-              Saved against this machine so the next person who asks sees it alongside the manual.
-            </p>
-            <div className="flex gap-2">
-              <input
-                value={fixText}
-                onChange={(e) => setFixText(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && submitFix()}
-                placeholder="e.g. Replaced the worn drive belt and re-tensioned to 45 Nm"
-                className="flex-1 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-emerald-500"
-              />
-              <button
-                onClick={submitFix}
-                disabled={isResolving || !fixText.trim()}
-                className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-bold text-white disabled:opacity-40"
-              >
-                {isResolving ? <Loader2 size={16} className="animate-spin" /> : "Save"}
-              </button>
-            </div>
-          </div>
+          <ResolveFixModal
+            sessionId={activeSessionId}
+            machineLabel={machineLabel}
+            onClose={() => setShowResolve(false)}
+          />
         )}
 
         <div className="flex-1 space-y-4 overflow-y-auto p-4 md:p-6">
@@ -229,13 +231,26 @@ export default function AskPage() {
             <div key={i} className="space-y-2">
               <AnswerBubble message={m} />
               {i === lastAgentIndex && !isAsking && (
-                <StepCard
-                  visible
-                  inWizard={inWizard}
-                  intent={intent}
-                  disabled={isAsking}
-                  onAction={(msg, mode) => send(msg, mode)}
-                />
+                <>
+                  <QuickReplyCard
+                    questions={pendingQuestions}
+                    disabled={isAsking}
+                    onAnswer={(msg) => send(msg, "wizard")}
+                    onOther={answerOther}
+                    onSolved={openResolve}
+                  />
+                  {/* Once the guided fix is asking its own questions ("did that fix
+                      it?"), the generic done/stuck buttons would just duplicate them. */}
+                  {!(inWizard && pendingQuestions.length > 0) && (
+                    <StepCard
+                      visible
+                      inWizard={inWizard}
+                      intent={intent}
+                      disabled={isAsking}
+                      onAction={(msg, mode) => send(msg, mode)}
+                    />
+                  )}
+                </>
               )}
             </div>
           ))}
@@ -287,6 +302,7 @@ export default function AskPage() {
               <Paperclip size={20} />
             </button>
             <textarea
+              ref={inputRef}
               rows={1}
               value={input}
               onChange={(e) => setInput(e.target.value)}

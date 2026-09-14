@@ -16,6 +16,7 @@ Differences from the Zynaptrix assistant this is adapted from:
 import base64
 import json
 import logging
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -100,8 +101,21 @@ class MessageOut(BaseModel):
     timestamp: str
 
 
+class FixMethod(str, Enum):
+    HANDS_ON = "hands_on"            # engineer's own experience
+    SYSTEM_GUIDED = "system_guided"  # followed the assistant's instructions
+    BOTH = "both"
+
+
 class ResolveRequest(BaseModel):
-    operator_fix: str
+    engineer: Optional[str] = None
+    root_cause: Optional[str] = None
+    actions: Optional[str] = None
+    method: Optional[FixMethod] = None
+    parts_replaced: Optional[str] = None
+    # The original single free-text field. Still accepted, and used as `actions`
+    # when a caller sends only this.
+    operator_fix: Optional[str] = None
 
 
 def get_db():
@@ -278,6 +292,54 @@ def _has_content(db: Session, manual_id: str) -> int:
     return qdrant_store.count_manual_chunks(manual_id)
 
 
+_ASK_TAG = re.compile(r"\[ASK:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+MAX_QUESTIONS = 2
+MAX_OPTIONS = 5
+MAX_OPTION_CHARS = 60
+
+
+def _extract_questions(answer: str) -> tuple:
+    """Pull `[ASK: question | answer | answer]` tags out of a reply.
+
+    Returns (answer without the tags, [{question, options}]). The tag is
+    removed from the stored text so it never shows as raw brackets; the chat
+    renders the question with tappable answers instead. A tag with no usable
+    question, or fewer than two answers, is dropped rather than shown half-made.
+    """
+    if not answer:
+        return answer, []
+    questions = []
+    for m in _ASK_TAG.finditer(answer):
+        parts = [p.strip() for p in m.group(1).split("|")]
+        question, options = (parts[0] if parts else ""), []
+        for opt in parts[1:]:
+            opt = opt.strip(" .")[:MAX_OPTION_CHARS].strip()
+            if opt and opt.lower() not in {o.lower() for o in options}:
+                options.append(opt)
+        if question and len(options) >= 2 and len(questions) < MAX_QUESTIONS:
+            questions.append({"question": question[:200], "options": options[:MAX_OPTIONS]})
+    cleaned = _ASK_TAG.sub("", answer)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, questions
+
+
+def _pending_questions(db: Session, session_id: int) -> list:
+    """Questions the latest agent reply asked and the technician hasn't
+    answered yet (the user message just stored is the answer, if any)."""
+    last_agent = (
+        db.query(AssistantMessage)
+        .filter(AssistantMessage.session_id == session_id, AssistantMessage.role == "agent")
+        .order_by(desc(AssistantMessage.id))
+        .first()
+    )
+    if not last_agent or not last_agent.step_data:
+        return []
+    try:
+        return (json.loads(last_agent.step_data) or {}).get("questions") or []
+    except (ValueError, TypeError):
+        return []
+
+
 def _original_topic(db: Session, session_id: int) -> Optional[str]:
     """The session's first user message - the actual topic being discussed.
 
@@ -315,6 +377,12 @@ async def list_sessions(db: Session = Depends(get_db)):
 
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: int, db: Session = Depends(get_db)):
+    # A fix filed from this chat goes with it. This is also how a wrongly
+    # recorded fix is taken out of recall.
+    try:
+        qdrant_store.delete_interaction_memory_for_session(session_id)
+    except Exception as e:
+        logger.warning("Could not remove recorded fix for session %s: %s", session_id, e)
     db.query(AssistantMessage).filter(AssistantMessage.session_id == session_id).delete()
     db.query(AssistantSession).filter(AssistantSession.id == session_id).delete()
     db.commit()
@@ -395,6 +463,8 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
     images: List[str] = []
     attachments: List[Dict[str, Any]] = []
     cross_manual: List[Dict[str, Any]] = []
+    past_incidents: List[Dict[str, Any]] = []
+    effective_mode = req.mode
 
     if manual_id:
         chunk_count = _has_content(db, manual_id)
@@ -404,7 +474,19 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
             logger.info("[Provenance] %d manual chunks found for %s.", chunk_count, manual_id)
 
         intent = req.intent.value if req.intent else (session.intent or ChatIntent.TROUBLESHOOT.value)
-        if req.mode == AskMode.WIZARD:
+        # A reply to a question the assistant just asked ("what does the gauge
+        # show?") is the technician reporting a check result, not a new fault
+        # report. Re-diagnosing from scratch would throw that answer away, so
+        # it continues the guided fix - whether it came from a tapped answer
+        # or was typed.
+        if (
+            effective_mode == AskMode.ANSWER
+            and intent == ChatIntent.TROUBLESHOOT.value
+            and _pending_questions(db, session.id)
+        ):
+            effective_mode = AskMode.WIZARD
+
+        if effective_mode == AskMode.WIZARD:
             # A learning walkthrough is not a repair: the repair wizard opens with
             # lockout/tagout, which is the wrong first move when nothing is broken.
             mode = (
@@ -415,7 +497,9 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
         elif intent == ChatIntent.LEARN.value:
             mode = RAGMode.LEARNING
         else:
-            mode = RAGMode.SUMMARY
+            # A fault report gets the structured diagnosis (safety, likely
+            # causes, checks in order) rather than SUMMARY's three sentences.
+            mode = RAGMode.DIAGNOSIS
         query = req.query if chunk_count else f"{MISSING_MANUAL_FLAG} {req.query}"
         history_text = "\n".join(f"{m.role.upper()}: {m.content}" for m in history)
 
@@ -424,14 +508,16 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
         # see _original_topic(). Ordinary Q&A keeps using the live query: each
         # new question there is legitimately free to change topic.
         retrieval_query = None
-        if req.mode == AskMode.WIZARD:
+        if effective_mode == AskMode.WIZARD:
             topic = _original_topic(db, session.id)
             if topic and topic.strip() and topic.strip() != req.query.strip():
                 retrieval_query = f"{topic}. {req.query}"
 
         try:
             result = _rag.generate_response(
-                query, manual_id, machine_id or manual_id,
+                # machine_id may be None; past fixes are filed and recalled per
+                # machine, so the manual id must not stand in for one.
+                query, manual_id, machine_id,
                 mode=mode, chat_history=history_text, retrieval_query=retrieval_query,
             )
             # Returned verbatim: a second summarising pass strips the [IMAGE_n]
@@ -439,6 +525,7 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
             answer = result.get("answer") or "No response generated."
             images = _absolute_image_urls(result.get("images", []))
             cross_manual = result.get("cross_manual", []) or []
+            past_incidents = result.get("past_incidents", []) or []
             # Figure URLs are stored repo-relative when Cloudinary is off, so the
             # same absolutising the image list gets has to reach inside attachments.
             attachments = []
@@ -476,11 +563,21 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
         answer = res.choices[0].message.content
         source = "General knowledge (no machine selected)"
 
+    answer, questions = _extract_questions(answer or "")
+    # Saved with the message so reopening the chat still shows the past-fix card
+    # and the tappable answers, not just the text.
+    step_data = {}
+    if past_incidents:
+        step_data["past_incidents"] = past_incidents
+    if questions:
+        step_data["questions"] = questions
+
     db.add(AssistantMessage(
         session_id=session.id, role="agent", content=answer,
-        type="wizard_step" if req.mode == AskMode.WIZARD else "text",
+        type="wizard_step" if effective_mode == AskMode.WIZARD else "text",
         images=json.dumps(images) if images else None,
         attachments=json.dumps(attachments) if attachments else None,
+        step_data=json.dumps(step_data) if step_data else None,
         timestamp=_now(),
     ))
     session.updated_at = _now()
@@ -499,7 +596,12 @@ async def ask(req: AssistantQuery, db: Session = Depends(get_db)):
         # Where else this topic is documented. Attributed, never merged into the
         # answer as though it described this machine.
         "cross_manual": cross_manual,
-        "mode": req.mode.value,
+        # Confirmed fixes from earlier on this same machine, straight from the
+        # database - shown as a card, never paraphrased by the model.
+        "past_incidents": past_incidents,
+        # Questions the reply asks, each with answers the technician can tap.
+        "questions": questions,
+        "mode": effective_mode.value,
         "intent": session.intent,
         "context_source": source,
         "timestamp": _now(),
@@ -766,8 +868,19 @@ async def resolve_session(session_id: int, req: ResolveRequest, db: Session = De
             status_code=400,
             detail="This session is not tied to a machine, so the fix cannot be filed against one.",
         )
-    if not req.operator_fix.strip():
-        raise HTTPException(status_code=400, detail="operator_fix is required")
+
+    def clean(value: Optional[str]) -> str:
+        return (value or "").strip()
+
+    fix = {
+        "engineer": clean(req.engineer),
+        "root_cause": clean(req.root_cause),
+        "actions": clean(req.actions) or clean(req.operator_fix),
+        "method": req.method.value if req.method else None,
+        "parts_replaced": clean(req.parts_replaced),
+    }
+    if not fix["actions"]:
+        raise HTTPException(status_code=400, detail="Describe what was done to restore the machine.")
 
     messages = (
         db.query(AssistantMessage)
@@ -776,17 +889,80 @@ async def resolve_session(session_id: int, req: ResolveRequest, db: Session = De
         .all()
     )
     history_text = "\n".join(f"{m.role}: {m.content}" for m in messages)
+    symptom = _original_topic(db, session_id)
+    manual_id = _resolve_manual(db, session.machine_id, None)
 
     try:
-        summary = summarize_and_archive(history_text, req.operator_fix, session.machine_id, db)
-        session.resolved_at = _now()
+        # Saving again replaces the earlier record rather than filing the same
+        # repair twice, which would make it look like a recurring fault.
+        if session.resolved_at:
+            qdrant_store.delete_interaction_memory_for_session(session_id)
+        summary = summarize_and_archive(
+            history_text, fix, session.machine_id, manual_id, session_id, symptom, db
+        )
+        record = {**fix, "symptom": symptom, "summary": summary, "resolved_at": _now()}
+        session.resolved_at = record["resolved_at"]
+        session.resolution = json.dumps(record)
         db.commit()
     except Exception as e:
         db.rollback()
         logger.error("Failed to archive fix for session %s: %s", session_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not save the fix: {e}")
 
-    return {"status": "resolved", "session_id": session_id, "summary": summary}
+    return {"status": "resolved", "session_id": session_id, "summary": summary, "resolution": record}
+
+
+@router.post("/sessions/{session_id}/resolve-draft")
+async def resolve_draft(session_id: int, db: Session = Depends(get_db)):
+    """A starting point for the fix form, drafted from the conversation.
+
+    Only what the chat actually says: fields the conversation doesn't settle
+    come back empty for the engineer to fill. The engineer's name and the
+    method are never drafted - only the person who did the work knows those.
+    """
+    session = db.query(AssistantSession).filter(AssistantSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    messages = (
+        db.query(AssistantMessage)
+        .filter(AssistantMessage.session_id == session_id)
+        .order_by(AssistantMessage.id)
+        .all()
+    )
+    empty = {"root_cause": "", "actions": "", "parts_replaced": ""}
+    if not messages:
+        return empty
+
+    conversation = "\n\n".join(f"{m.role.upper()}: {m.content}" for m in messages)[-8000:]
+    prompt = (
+        "Below is a maintenance chat between a technician and an assistant. Draft the fix "
+        "record the engineer will check and correct. Return JSON with keys:\n"
+        '  "root_cause": what the technician found was actually wrong (1-2 sentences)\n'
+        '  "actions": what was done to restore the machine, as short numbered lines\n'
+        '  "parts_replaced": parts replaced, comma separated\n\n'
+        "STRICT RULES:\n"
+        "- Use ONLY what the TECHNICIAN confirmed in the chat (a check result they reported, "
+        "a step they said they completed). The assistant suggesting a cause or a step does "
+        "NOT mean it was the cause or that it was done.\n"
+        "- If the chat does not establish a field, return an empty string for it. An empty "
+        "field is correct; a guess is wrong.\n\n"
+        f"CHAT:\n{conversation}"
+    )
+    try:
+        data = loads_tolerant(chat_json(MODEL_CHAT_LIGHT, prompt, max_tokens=500, temperature=0.0) or "")
+    except Exception as e:
+        logger.warning("Fix draft failed for session %s: %s", session_id, e)
+        return empty
+    if not isinstance(data, dict):
+        return empty
+
+    def text(value) -> str:
+        if isinstance(value, list):
+            value = "\n".join(str(v) for v in value)
+        return str(value or "").strip()
+
+    return {key: text(data.get(key)) for key in empty}
 
 
 # ── Report ───────────────────────────────────────────────────────────────────
@@ -850,5 +1026,6 @@ async def session_report(session_id: int, db: Session = Depends(get_db)):
         "solutionSteps": extracted.get("solution_steps", []),
         "images": [{"url": u, "caption": f"Figure {i + 1}"} for i, u in enumerate(ordered_images)],
         "resolvedAt": session.resolved_at,
+        "resolution": json.loads(session.resolution) if session.resolution else None,
         "timestamp": session.created_at,
     }

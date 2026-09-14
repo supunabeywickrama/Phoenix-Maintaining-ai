@@ -115,6 +115,10 @@ class AssistantSession(Base):
     created_at = Column(String, nullable=False)
     updated_at = Column(String, nullable=False)
     resolved_at = Column(String, nullable=True)  # set when a fix is archived
+    # JSON fix record (engineer, root cause, actions, method, parts). The
+    # relational copy for reports and the session view; the searchable copy
+    # lives in Qdrant's interaction_memory.
+    resolution = Column(Text, nullable=True)
 
 
 class AssistantMessage(Base):
