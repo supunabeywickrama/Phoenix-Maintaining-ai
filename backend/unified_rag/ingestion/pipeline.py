@@ -19,9 +19,24 @@ async def process_manual_async(file_path: str, manual_id: str):
     captioner = ImageCaptioner()
     tabler = TableTransformer()
 
+    # 0. Page preparation: scanned / photographed pages are made upright,
+    #    cropped to the sheet and straightened. Digital pages are untouched and
+    #    page numbers stay 1:1 with the uploaded PDF.
+    from services.page_prep import prepare_pdf
+    print(f"🧭 [Pipeline] Stage 0/5: Preparing scanned pages...")
+    prepared_path, _fixes = prepare_pdf(file_path)
+
     # 1. Structural Parsing (includes YOLOv8 + validation + figure splitting)
     print(f"🔍 [Pipeline] Stage 1/5: Multi-modal Structural Parsing...")
-    parsed_data = parser.parse_pdf(file_path, manual_id)
+    try:
+        parsed_data = parser.parse_pdf(prepared_path, manual_id)
+    finally:
+        if prepared_path != file_path:
+            import os
+            try:
+                os.remove(prepared_path)
+            except OSError:
+                pass
 
     # 2. Adaptive Chunking
     print(f"✂️ [Pipeline] Stage 2/5: Semantic recursive chunking...")
@@ -160,7 +175,10 @@ async def process_manual_async(file_path: str, manual_id: str):
             # Parts-list entries: exact-match lookup by part number, which a
             # vector alone does badly on codes like "17C-612".
             "ref": (chunk.get("metadata") or {}).get("ref"),
-            "part_numbers": (chunk.get("metadata") or {}).get("part_numbers"),
+            # A figure's letter-number item codes ("B08-13") share the exact-lookup
+            # field, so a search for a code printed on a drawing finds the drawing.
+            "part_numbers": (chunk.get("metadata") or {}).get("part_numbers")
+                            or (chunk.get("metadata") or {}).get("item_codes"),
         })
         if len(buffer) >= BATCH:
             flush()

@@ -72,6 +72,7 @@ class PartsList:
     source: str                    # "text_layer" | "ocr+vision" | "vision"
     verified: bool                 # True only when read from the printed text
     pages: list = field(default_factory=list)
+    drawing_numbers: list = field(default_factory=list)
 
     @property
     def refs(self) -> set:
@@ -717,32 +718,49 @@ def _norm_title(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", clean(text).lower()).strip()
 
 
-def match_parts_list(figure_page_text: str, callouts: set, candidates: list) -> Optional[tuple]:
+def drawing_family(number: str) -> str:
+    """"CA3-15583-2" -> "CA3-15583": sheets of one drawing set share the stem."""
+    n = re.sub(r"\s+", "", (number or "").upper())
+    return re.sub(r"-\d{1,2}$", "", n) if re.search(r"-\d{1,2}$", n) and n.count("-") >= 2 else n
+
+
+def callout_sort_key(c: str):
+    return (0, int(c)) if str(c).isdigit() else (1, str(c))
+
+
+def match_parts_list(figure_page_text: str, callouts: set, candidates: list,
+                     figure_page: int = None, figure_drawings: list = ()) -> Optional[tuple]:
     """Choose the parts list that belongs to a figure.
 
-    Evidence, strongest first: the list's subtitle or title is printed on the
-    figure's page, and the list's refs cover the figure's callout numbers.
+    Evidence: the list's title is printed on the figure's page; the list's refs
+    cover the figure's callouts; the list and the figure are sheets of the same
+    drawing set (e.g. CA3-15583-2 and CA3-15583-3 - a scanned manual kept its
+    parts list on one sheet and the drawings using it on the next two); and
+    the list is on a nearby page. Coverage alone is not enough for a list far
+    away in another drawing set - any list numbered 1-124 covers small numbers.
     Returns (parts_list, coverage, missing_callouts) or None.
     """
     page_norm = _norm_title(figure_page_text)
+    families = {drawing_family(d) for d in figure_drawings or [] if d}
     best = None
     for pl in candidates:
         title_hit = any(
             t and _norm_title(t) and _norm_title(t) in page_norm
             for t in (pl.subtitle, pl.title)
         )
+        family_hit = bool(families & {drawing_family(d) for d in (pl.drawing_numbers or []) if d})
+        near = figure_page is None or abs(pl.page - figure_page) <= 2
         coverage = (len(callouts & pl.refs) / len(callouts)) if callouts else 0.0
-        # Title match is enough on its own only when the numbers don't
-        # contradict it; numbers alone need to cover most of the drawing.
-        if not ((title_hit and (not callouts or coverage >= 0.4)) or coverage >= 0.7):
+        if not ((title_hit and (not callouts or coverage >= 0.4))
+                or (coverage >= 0.7 and (near or family_hit))):
             continue
-        score = coverage + (1.0 if title_hit else 0.0)
+        score = coverage + (1.0 if title_hit else 0.0) + (0.8 if family_hit else 0.0) + (0.2 if near else 0.0)
         if best is None or score > best[0]:
             best = (score, pl, coverage)
     if not best:
         return None
     _, pl, coverage = best
-    return pl, round(coverage, 2), sorted(callouts - pl.refs, key=int)
+    return pl, round(coverage, 2), sorted(callouts - pl.refs, key=callout_sort_key)
 
 
 def merge_continuation(first: PartsList, following: list) -> PartsList:

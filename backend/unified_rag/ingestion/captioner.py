@@ -332,8 +332,12 @@ class ImageCaptioner:
         Here the manual's own title and list are the anchor, the answer is
         plain text, and the section name is never used.
         """
-        heading = " ".join(filter(None, [parts.get("title"), parts.get("subtitle")])) or label
         drawing = metadata.get("drawing_code") or ""
+        # Where the sheet title could not be read, the drawing number names it.
+        # Falling back to a generic label produced captions that called the
+        # drawing itself "This Parts list ...".
+        heading = (" ".join(filter(None, [parts.get("title"), parts.get("subtitle")]))
+                   or (f"drawing {drawing}" if drawing else "this exploded view"))
         page_text = " ".join((metadata.get("page_text") or "").split())[:PAGE_TEXT_PREVIEW]
         refs = [g for g in groups if g.get("ref")]
         listing = "\n".join(

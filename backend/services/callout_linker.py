@@ -120,8 +120,12 @@ def link_image_chunks(chunks) -> int:
     """
     # Figures already named from their own parts list are exact; guessing names
     # from text snippets could only add a second, worse listing.
+    # Scanned figures are skipped too: their numbers were read from circles on
+    # the drawing, and guessing names from nearby text invented "parts" for a
+    # photographed controller screen from its setting values.
     image_chunks = [c for c in chunks if c.get("type") == "image"
-                    and not (c.get("metadata") or {}).get("parts_resolved")]
+                    and not (c.get("metadata") or {}).get("parts_resolved")
+                    and not (c.get("metadata") or {}).get("scanned")]
     text_chunks = [c for c in chunks if c.get("type") in ("text", "table")]
     if not image_chunks or not text_chunks:
         return 0

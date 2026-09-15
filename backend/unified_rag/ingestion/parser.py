@@ -389,6 +389,8 @@ class DocumentParser:
             page_has_text_layer, read_text_layer, read_scanned,
             page_text as scanned_page_text,
         )
+        from services.page_prep import is_scanned
+        from services.scanned_page import parse_scanned_page
 
         print(f"📄 [Parser] Opening PDF: {file_path}")
         doc = fitz.open(file_path)
@@ -406,6 +408,23 @@ class DocumentParser:
             page_idx = page_num + 1
             print(f"   ∟ Processing Page {page_idx}/{total_pages}...")
             page = doc.load_page(page_num)
+
+            # A scanned or photographed page (made upright by services/page_prep
+            # before parsing) has no text layer: layout detection sees it as one
+            # big picture, and the text/table readers below find nothing. It
+            # gets its own reader - see services/scanned_page.py.
+            if is_scanned(page):
+                try:
+                    result = parse_scanned_page(page, page_idx, manual_id, self.cloudinary)
+                except Exception as e:
+                    print(f"      ⚠️ [Parser] Scanned page {page_idx} could not be read: {e}")
+                    result = {"chunks": [], "figure": None, "parts_list": None}
+                parsed_data.extend(result["chunks"])
+                if result["figure"]:
+                    figures.append(result["figure"])
+                if result["parts_list"]:
+                    parts_lists[page_idx] = result["parts_list"]
+                continue
 
             # Full page text, independent of the YOLO-detected text blocks used
             # for chunking below. Captions are grounded against this so a vision
@@ -748,7 +767,12 @@ class DocumentParser:
         before. On a scanned page with no text layer the list is read by vision
         and flagged unverified.
         """
-        scanned_checked = set()   # scanned pages already tried, list or not
+        from services.page_prep import is_scanned
+        from services.parts_list import drawing_family
+        # Image-only pages were fully read in the main loop (scanned_page.py);
+        # the older per-page scanned reader is only for pages not handled there.
+        scanned_checked = {i + 1 for i in range(len(doc)) if is_scanned(doc[i])}
+        list_usage = {}   # list key -> the list and every figure paired with it
         for fig in figures:
             page = fig["page"]
             chunk = fig["chunk"]
@@ -757,8 +781,19 @@ class DocumentParser:
             if not numbered:
                 continue
 
-            window = [p for p in (page, page + 1, page + 2, page - 1) if 1 <= p <= len(doc)]
+            # Lists on the figure's page, up to two pages after and two before.
+            # (A scanned manual kept its list on the page between the circuit
+            # diagram and the drawings that use it.)
+            window = [p for p in (page, page + 1, page + 2, page - 1, page - 2) if 1 <= p <= len(doc)]
             candidates = [parts_lists[p] for p in window if p in parts_lists]
+            # Plus any list, anywhere in the manual, from the same drawing set:
+            # a scanned manual printed the list for sheets CA3-15583-3 and -4 on
+            # sheet CA3-15583-2.
+            fams = {drawing_family(d) for d in fig.get("drawing_numbers") or [] if d}
+            if fams:
+                for pl in parts_lists.values():
+                    if pl not in candidates and fams & {drawing_family(d) for d in pl.drawing_numbers or [] if d}:
+                        candidates.append(pl)
             # Every unread scanned page in the window is read - not only when
             # nothing was found. A neighbouring figure's list already loaded (the
             # Counterweight list on the page before) used to stop the Caliper
@@ -767,9 +802,6 @@ class DocumentParser:
                 if p in parts_lists or p in scanned_checked or page_has_text_layer(doc[p - 1]):
                     continue
                 scanned_checked.add(p)
-                # Scanned page: OCR rows, each checked against a vision read
-                # (services/parts_list.read_scanned). Only pages next to a
-                # numbered figure are read, since OCR costs ~25 s a page.
                 pl = read_scanned(doc[p - 1])
                 if pl:
                     parts_lists[p] = pl
@@ -789,7 +821,8 @@ class DocumentParser:
                         },
                     })
 
-            match = match_parts_list(fig["page_text"], fig["callouts"], candidates)
+            match = match_parts_list(fig["page_text"], fig["callouts"], candidates,
+                                     figure_page=page, figure_drawings=fig.get("drawing_numbers") or [])
             if not match:
                 print(f"      [PartsList] No parts list found for the figure on page {page}.")
                 continue
@@ -797,8 +830,18 @@ class DocumentParser:
             following = [parts_lists[p] for p in range(found.page + 1, found.page + 3) if p in parts_lists]
             plist = merge_continuation(copy.deepcopy(found), following)
 
+            # Only the parts this drawing actually shows. One scanned list
+            # (items 1-124) served three drawings; giving each drawing all 124
+            # parts described parts that are not on it at all. When callouts were
+            # read from the drawing, the figure gets just those.
+            groups = plist.grouped()
+            shown = fig["callouts"]
+            if shown and len(shown) >= 3:
+                groups = [(ref, rows) for ref, rows in groups if not ref or ref in shown]
+
             print(f"      [PartsList] Figure p{page} <- list p{plist.pages}: "
-                  f"{len(plist.refs)} refs, callout coverage {coverage:.0%}"
+                  f"{len([g for g in groups if g[0]])} of {len(plist.refs)} parts shown on this drawing, "
+                  f"callout coverage {coverage:.0%}"
                   + (f", callouts with no list entry: {missing}" if missing else ""))
 
             meta["parts_list"] = {
@@ -808,21 +851,26 @@ class DocumentParser:
                 "verified": plist.verified,
                 "coverage": coverage,
                 "missing_callouts": missing,
-                "groups": [
-                    {"ref": ref, "rows": [vars(r) for r in rows]}
-                    for ref, rows in plist.grouped()
-                ],
+                "groups": [{"ref": ref, "rows": [vars(r) for r in rows]} for ref, rows in groups],
             }
+            key = (plist.page, plist.title, plist.subtitle)
+            usage = list_usage.setdefault(key, {"plist": plist, "figures": []})
+            usage["figures"].append((page, chunk, meta.get("drawing_code"),
+                                     set(shown) if shown and len(shown) >= 3 else set(plist.refs)))
 
-            # One entry per part, each its own vector. A single figure vector
-            # holding 35 parts matches a question about any one of them only
-            # weakly; "part number for the caliper hose" should land on exactly
-            # ref 30, and bring its drawing with it via parent_path.
-            heading = " ".join(filter(None, [plist.title, plist.subtitle])) or "Parts list"
-            code = f" (drawing {meta['drawing_code']})" if meta.get("drawing_code") else ""
+        # One entry per part, per list - written once, after every figure has
+        # been paired, naming only the drawing(s) the callout was actually read
+        # on. Written per figure before, the 124-item scanned list became 372
+        # entries, two of every three claiming a part was on a drawing that does
+        # not show it.
+        for usage in list_usage.values():
+            plist = usage["plist"]
+            heading = (" ".join(filter(None, [plist.title, plist.subtitle]))
+                       or f"Parts list, page {plist.page}")
             for ref, rows in plist.grouped():
                 if not ref:
                     continue
+                on = [(pg, ch, code) for pg, ch, code, refs in usage["figures"] if ref in refs]
                 first, alts = rows[0], rows[1:]
                 text = (f"{heading} — part ref {ref}: {first.description}, part number "
                         f"{first.part_number}")
@@ -836,28 +884,29 @@ class DocumentParser:
                         text += f", quantity {a.qty}"
                     if a.remarks:
                         text += f", {a.remarks}"
-                text += (f". Shown as callout {ref} in the figure on page {page}{code}; "
-                         f"listed on page {plist.page}.")
+                if on:
+                    where = "; ".join(f"page {pg}" + (f" (drawing {code})" if code else "") for pg, _, code in on)
+                    text += f". Shown as callout {ref} in the figure on {where}; listed on page {plist.page}."
+                else:
+                    text += (f". Listed on page {plist.page}; callout {ref} was not read on any drawing "
+                             f"(it may be missing from the scan or too small to read).")
                 if not plist.verified:
-                    checks = [r.check for r in rows]
-                    if all(c.startswith("confirmed by OCR and vision") for c in checks):
-                        text += " (Scanned page: ref, part number, description and quantity confirmed by two independent readings.)"
+                    unsure = [r.check for r in rows if not r.check.startswith("confirmed")]
+                    if not unsure:
+                        text += " (Scanned page: item number, part code and quantity confirmed by two independent readings.)"
                     else:
-                        text += (" (Scanned page - not fully confirmed: "
-                                 + " | ".join(dict.fromkeys(c for c in checks if not c.startswith("confirmed")))
-                                 + ")")
+                        text += " (Scanned page - not fully confirmed: " + " | ".join(dict.fromkeys(unsure)) + ")"
                 parsed_data.append({
                     "type": "part",
                     "content": text,
-                    "page": page,
+                    "page": on[0][0] if on else plist.page,
                     "path": None,
-                    "parent_path": chunk["path"],
+                    "parent_path": on[0][1]["path"] if on else None,
                     "kind": "part",
                     "metadata": {
                         "ref": ref,
                         "part_numbers": [r.part_number for r in rows if r.part_number],
                         "parts_list_page": plist.page,
                         "verified": plist.verified,
-                        "section": meta.get("section"),
                     },
                 })

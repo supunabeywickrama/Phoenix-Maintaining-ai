@@ -30,7 +30,13 @@ MIN_MEMORY_RELEVANCE = 0.47
 # Part numbers as printed in parts lists: "6710415", "17C-612", "83FN-3".
 # Pulled out of a question for an exact lookup, since an embedding of a bare
 # code carries little meaning to match on.
-_PART_NUMBER = re.compile(r"\b(?:\d{6,8}|[0-9]{1,3}[A-Z]{1,3}-\d{1,4}[A-Z]?)\b", re.IGNORECASE)
+_PART_NUMBER = re.compile(
+    # "6710415", "17C-612", and letter-first codes like "DSG-01-3C2" or
+    # "KCG-3-250-D-Z-M-U-HL1-10" - the first pattern missed those, so a search
+    # for DSG-01-3C2 returned DSG-03-3C2 instead of the exact part.
+    r"\b(?:\d{6,8}|[0-9]{1,3}[A-Z]{1,3}-\d{1,4}[A-Z]?|[A-Z][A-Z0-9]{0,5}(?:-[A-Z0-9]{1,6}){1,8})\b",
+    re.IGNORECASE)
+_ITEM_CODE = re.compile(r"\b[A-Z]{1,2}\d{1,3}-\d{1,3}\b", re.IGNORECASE)
 
 
 def _is_part(chunk) -> bool:
@@ -90,6 +96,8 @@ class RetrievalEngine:
         # 1b. A part number named in the question is looked up exactly and put
         #     first - "what is 6710415?" should never depend on vector luck.
         exact = self._exact_part_matches(query, manual_id)
+        exact_figures = [e for e in exact if e.type == "image"]
+        exact = [e for e in exact if e.type != "image"]
         exact_ids = {e.id for e in exact}
         text_results = exact + [c for c in text_results if c.id not in exact_ids]
 
@@ -99,6 +107,11 @@ class RetrievalEngine:
         # 2a. A matched parts-list entry brings the drawing it is a callout on,
         #     so an answer about "the caliper hose" can show where ref 30 is.
         image_results = self._with_part_figures(text_results, image_results, manual_id)
+        # 2b. A drawing that carries an item code named in the question
+        #     ("B08-13") is shown first, found by the code itself.
+        if exact_figures:
+            exact_paths = {f.path for f in exact_figures}
+            image_results = exact_figures + [i for i in image_results if i.path not in exact_paths]
 
         # 2b. Tables get their own slots. Sharing the text budget meant a torque
         #     schedule lost to three paragraphs of prose and was never shown, even
@@ -124,7 +137,9 @@ class RetrievalEngine:
         }
 
     def _exact_part_matches(self, query: str, manual_id: str) -> list:
-        numbers = sorted({m.group(0).upper() for m in _PART_NUMBER.finditer(query or "")})
+        # A code has at least one digit - "X-ray" matches the shape but is a word.
+        numbers = sorted({m.group(0).upper() for m in _PART_NUMBER.finditer(query or "")
+                          if re.search(r"\d", m.group(0))})
         if not numbers or not manual_id:
             return []
         try:
